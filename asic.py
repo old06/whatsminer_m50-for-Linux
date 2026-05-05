@@ -242,8 +242,8 @@ class DeviceMonitor:
         
         header = f"ASIC Monitor v1.2 | Устройств: {len(valid_data)} (ON: {online_count} OFF: {offline_count} RST: {len(self.restarting_devices)})"
         stats = f"Хэшрейт: {total_hashrate:.1f} TH/s | Питание: {total_power/1000:.1f} kW | Темп: {avg_temp:.1f}°C"
-        stdscr.addstr(0, 0, header, curses.A_BOLD | curses.color_pair(7))
-        stdscr.addstr(1, 0, stats, curses.color_pair(7))
+        self._safe_addstr(stdscr, 0, 0, header, curses.A_BOLD | curses.color_pair(7))
+        self._safe_addstr(stdscr, 1, 0, stats, curses.color_pair(7))
         
         self._draw_devices_list(stdscr, h, w, valid_data)
         self._draw_progress_bars(stdscr, h, w)
@@ -252,7 +252,7 @@ class DeviceMonitor:
             "[Space]Выбор [A]Все [R]Рестарт [U]Обновить [F]Вент [L]LED [M]Питание [L]Лимит [P]Пулы [D]Детали "
             "[C]Частота [V]Напряжение [G]Логи [H]Хеш [B]Бэкап [N]Пароль [F]Сброс [Q]Выход"
         )
-        stdscr.addstr(h-1, 0, help_text.ljust(w-1), curses.A_REVERSE)
+        self._safe_addstr(stdscr, h-1, 0, help_text.ljust(w-1), curses.A_REVERSE)
         stdscr.refresh()
 
     async def _draw_device_details(self, stdscr, device: Dict, h: int, w: int):
@@ -306,6 +306,15 @@ class DeviceMonitor:
             reverse=True
         )
 
+    def _safe_addstr(self, stdscr, y, x, text, attr=0):
+        try:
+            max_width = stdscr.getmaxyx()[1] - x
+            if max_width <= 0:
+                return
+            stdscr.addstr(y, x, text[:max_width], attr)
+        except curses.error:
+            pass
+
     def _draw_devices_list(self, stdscr, h, w, devices):
         max_visible_rows = h - 8
         start_row = 3
@@ -331,10 +340,11 @@ class DeviceMonitor:
     def _format_device_line(self, device, status, width):
         fan_info = f"Fan: {device.get('fan_in', 0)}/{device.get('fan_out', 0)} RPM" if device.get('online') else ""
         freq_info = f"Freq: {device.get('target_freq', 0)}%" if device.get('online') else ""
-        return (f"{status} {device['ip']:15} | Temp: {device.get('temp', 0):.1f}°C | "
-               f"Hash: {device.get('hashrate', 0):.1f} TH/s | Power: {device.get('power', 0)/1000:.1f} kW | "
-               f"Up: {device.get('uptime', 'N/A')} | Ver: {device.get('fw_version', 'N/A')[:8]} | "
-               f"{freq_info} {fan_info}").ljust(width-1)
+        line = (f"{status} {device['ip']:15} | Temp: {device.get('temp', 0):.1f}°C | "
+                f"Hash: {device.get('hashrate', 0):.1f} TH/s | Power: {device.get('power', 0)/1000:.1f} kW | "
+                f"Up: {device.get('uptime', 'N/A')} | Ver: {device.get('fw_version', 'N/A')[:8]} | "
+                f"{freq_info} {fan_info}")
+        return line[:max(0, width-1)].ljust(width-1)
 
     def _get_device_color(self, device):
         if device['ip'] in self.restarting_devices:
@@ -537,14 +547,13 @@ class DeviceMonitor:
             await writer.drain()
     
             # Проверка подтверждения CRC
-            crc_confirmation = await asyncio.wait_for(reader.read(1), timeout=10)
+            try:
+                crc_confirmation = await asyncio.wait_for(reader.read(1), timeout=10)
+            except asyncio.TimeoutError:
+                raise ConnectionError("Таймаут подтверждения CRC")
+
             if crc_confirmation != b'\x01':
-                raise ConnectionError("Ошибка CRC подтверждения")
-
-            firmware_size = len(firmware_data)
-            logging.info(f"Отправка прошивки размером {firmware_size} байт на {ip}")
-
-            confirmation_received = False
+                raise ConnectionError(f"Ошибка CRC подтверждения: {crc_confirmation!r}")
             for attempt in range(3):
                 try:
                     writer.write(firmware_size.to_bytes(4, 'little'))
@@ -574,9 +583,13 @@ class DeviceMonitor:
                 self.operation_progress[ip] = ("update", time.time(), UPDATE_DURATION, f"upload {progress:.1%}")
 
             # Получение финального подтверждения
-            final_confirmation = await asyncio.wait_for(reader.read(1), timeout=30)
+            try:
+                final_confirmation = await asyncio.wait_for(reader.read(1), timeout=30)
+            except asyncio.TimeoutError:
+                raise ConnectionError("Таймаут финального подтверждения загрузки")
+
             if final_confirmation != b'\x01':
-                raise ConnectionError("Ошибка подтверждения загрузки")
+                raise ConnectionError(f"Ошибка подтверждения загрузки: {final_confirmation!r}")
 
             logging.info(f"{ip}: Прошивка успешно передана")
             self.operation_progress[ip] = ("update", time.time(), UPDATE_DURATION, "finalizing")

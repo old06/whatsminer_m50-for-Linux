@@ -83,10 +83,10 @@ class DeviceMonitor:
         self.device_errors: Dict[str, List] = defaultdict(list)
         self.salt_cache: Dict[str, str] = {}
         self.stats_cache = {"all_devices": []}
-        self.operation_queue = asyncio.Queue()
+        self.operation_queue = None
         self.operation_progress: Dict[str, Tuple] = {}
         self.firmware_path = DEFAULT_FIRMWARE
-        self.lock = asyncio.Lock()
+        self.lock = None
         self.restarting_devices: Set[str] = set()
         self.detailed_view = False  # Режим детального просмотра устройства
         
@@ -104,11 +104,17 @@ class DeviceMonitor:
             -999: "Сетевая ошибка"
         }
 
-        self.active_tasks.update({
-            asyncio.create_task(self._process_operations()),
-            asyncio.create_task(self._update_progress_bars()),
-            asyncio.create_task(self._update_stats())
-        })
+    async def _init_async_resources(self):
+        if self.operation_queue is None:
+            self.operation_queue = asyncio.Queue()
+        if self.lock is None:
+            self.lock = asyncio.Lock()
+        if not self.active_tasks:
+            self.active_tasks.update({
+                asyncio.create_task(self._process_operations()),
+                asyncio.create_task(self._update_progress_bars()),
+                asyncio.create_task(self._update_stats())
+            })
 
     async def monitor(self, stdscr):
         curses.curs_set(0)
@@ -116,6 +122,7 @@ class DeviceMonitor:
         stdscr.nodelay(True)
         curses.cbreak()
         self._init_colors()
+        await self._init_async_resources()
 
         try:
             while self.monitor_running:
@@ -472,7 +479,7 @@ class DeviceMonitor:
                 "power": summary.get('power-realtime', 0),
                 "target_freq": summary.get('target-freq', 100),
                 "uptime": self.format_uptime(summary.get('elapsed', 0)),
-                "pools": pools_data.get('msg', {}).get('pools', [])
+                "pools": pools
             }
         except Exception as e:
             logging.error(f"{ip}: Ошибка получения данных: {str(e)}")
@@ -540,6 +547,7 @@ class DeviceMonitor:
             # Вычисление CRC32 файла
             with open(self.firmware_path, 'rb') as f:
                 firmware_data = f.read()
+            firmware_size = len(firmware_data)
             crc32 = binascii.crc32(firmware_data)
             
             # Отправка CRC32
@@ -554,6 +562,8 @@ class DeviceMonitor:
 
             if crc_confirmation != b'\x01':
                 raise ConnectionError(f"Ошибка CRC подтверждения: {crc_confirmation!r}")
+
+            confirmation_received = False
             for attempt in range(3):
                 try:
                     writer.write(firmware_size.to_bytes(4, 'little'))
@@ -684,30 +694,32 @@ class DeviceMonitor:
         for attempt in range(retries):
             writer = None
             try:
-                if command['cmd'].startswith('set.'):
+                payload = dict(command)
+                if payload['cmd'].startswith('set.'):
                     salt = await self.get_salt(ip)
                     ts = int(time.time())
-                    command.update({
+                    payload.update({
                         "ts": ts,
-                        "token": self.generate_token(command['cmd'], salt, ts),
+                        "token": self.generate_token(payload['cmd'], salt, ts),
                         "account": self.current_account
                     })
-                    if any(cmd in command['cmd'] for cmd in ENCRYPTED_COMMANDS):
-                        command['param'] = self.encrypt_param(command['param'], command['cmd'], salt, ts)
+                    if any(cmd in payload['cmd'] for cmd in ENCRYPTED_COMMANDS):
+                        payload['param'] = self.encrypt_param(payload['param'], payload['cmd'], salt, ts)
 
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(ip, API_PORT),
                     timeout=CONNECTION_TIMEOUT
                 )
                 
-                data = json.dumps(command, ensure_ascii=False).encode()
+                data = json.dumps(payload, ensure_ascii=False).encode()
                 writer.write(len(data).to_bytes(4, 'little'))
                 await writer.drain()
                 writer.write(data)
                 await writer.drain()
 
-                length = int.from_bytes(await asyncio.wait_for(reader.read(4), READ_TIMEOUT), 'little')
-                response_data = await asyncio.wait_for(reader.read(length), READ_TIMEOUT)
+                length_bytes = await asyncio.wait_for(reader.readexactly(4), READ_TIMEOUT)
+                length = int.from_bytes(length_bytes, 'little')
+                response_data = await asyncio.wait_for(reader.readexactly(length), READ_TIMEOUT)
                 return json.loads(response_data.decode())
                 
             except (asyncio.TimeoutError, ConnectionError) as e:
@@ -1411,7 +1423,7 @@ def load_devices() -> List[str]:
         logging.error(f"Ошибка загрузки устройств: {str(e)}")
         return []
 
-async def main():
+def main():
     parser = argparse.ArgumentParser(description="Мониторинг ASIC-устройств")
     parser.add_argument("--scan", help="Диапазон сети для сканирования")
     parser.add_argument("--firmware", default=DEFAULT_FIRMWARE, help="Путь к файлу прошивки")
@@ -1421,16 +1433,17 @@ async def main():
         print("Необходимо указать --scan для первого запуска")
         return
 
-    devices = await scan_network(args.scan) if args.scan else load_devices()
+    devices = asyncio.run(scan_network(args.scan)) if args.scan else load_devices()
     monitor = DeviceMonitor(devices)
     monitor.firmware_path = args.firmware
-    
-    try:
-        await curses.wrapper(monitor.monitor)
-    except KeyboardInterrupt:
-        logging.info("Завершено пользователем")
-    finally:
-        await monitor.cleanup()
+
+    def curses_main(stdscr):
+        try:
+            asyncio.run(monitor.monitor(stdscr))
+        except KeyboardInterrupt:
+            logging.info("Завершено пользователем")
+
+    curses.wrapper(curses_main)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

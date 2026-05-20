@@ -1,4 +1,3 @@
-python-nmap
-pycryptodome
-python-dotenv
-httpx
+python-nmap>=0.6.1
+pycryptodome>=3.18.0
+python-dotenv>=1.0.0

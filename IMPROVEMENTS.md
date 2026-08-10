@@ -1,4 +1,9 @@
-# Улучшения и новые функции (v1.3)
+# Архив: неподдерживаемые функции
+
+Этот файл содержит исторические заметки и примеры функций, удалённых из
+кода. Не используйте перечисленные ниже команды. Актуальный список
+поддержки находится в README.md и соответствует официальной документации
+WhatsMiner API.
 
 ## 🐛 Исправленные ошибки
 
@@ -275,17 +280,24 @@ python3 asic.py
 ## 🔄 История версий
 
 ### v1.3
-- ✅ Добавлено 13+ новых функций для M50S
-- ✅ Исправлено 5+ ошибок
-- ✅ Добавлена полная валидация данных
-- ✅ Улучшена обработка ошибок
-- ✅ Добавлены специализированные классы исключений
 
 ### v1.2
-- Базовая функциональность мониторинга
-- Управление устройствами
-- Обновление прошивки
 
+# API compatibility notes
+
+The monitor follows the current WhatsMiner API documentation:
+
+- TCP port `4433` with a 4-byte little-endian length prefix.
+- Read commands use the documented `get.*` commands.
+- Write commands use `super`, `user1`, `user2`, or `user3` authentication.
+- Pool parameters use the documented AES-encrypted payload.
+- Firmware updates keep the connection open after the `ready` response and
+	send the 4-byte firmware size followed by the file bytes.
+
+The monitor does not expose commands that are absent from the official API,
+including voltage control, arbitrary log retrieval, configuration
+backup/restore, USB inspection, statistics reset, automatic recovery, and
+thermal-throttling control.
 ## ⚠️ Важные замечания
 
 1. **Частота и напряжение** - изменяются НА РИСК ПОЛЬЗОВАТЕЛЯ. Неправильные значения могут повредить оборудование.

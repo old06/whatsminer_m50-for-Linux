@@ -15,7 +15,6 @@ from Crypto.Util.Padding import pad
 from dotenv import load_dotenv
 import argparse
 from typing import Dict, List, Set, Tuple, Optional, Any
-import binascii
 
 load_dotenv()
 
@@ -185,16 +184,6 @@ class DeviceMonitor:
                 await self.factory_reset()
             elif key == ord('C'):
                 await self._set_frequency_dialog(stdscr)
-            elif key == ord('V'):
-                await self._set_voltage_dialog(stdscr)
-            elif key == ord('G'):
-                await self._get_logs_dialog(stdscr)
-            elif key == ord('H'):
-                await self._show_hashboard_info()
-            elif key == ord('B'):
-                await self._backup_config_dialog(stdscr)
-            elif key == ord('N'):
-                await self._change_password_dialog(stdscr)
             key = stdscr.getch()
 
     def _handle_key_up(self):
@@ -257,7 +246,7 @@ class DeviceMonitor:
         
         help_text = (
             "[Space]Выбор [A]Все [R]Рестарт [U]Обновить [F]Вент [L]LED [M]Питание [L]Лимит [P]Пулы [D]Детали "
-            "[C]Частота [V]Напряжение [G]Логи [H]Хеш [B]Бэкап [N]Пароль [F]Сброс [Q]Выход"
+            "[C]Частота [F]Сброс [Q]Выход"
         )
         self._safe_addstr(stdscr, h-1, 0, help_text.ljust(w-1), curses.A_REVERSE)
         stdscr.refresh()
@@ -447,20 +436,19 @@ class DeviceMonitor:
                 return {"ip": ip, "online": False}
             
             status_data = await self.send_command(ip, {"cmd": "get.miner.status", "param": "summary"})
-            setting_data = await self.send_command(ip, {"cmd": "get.miner.setting"})
             pools_data = await self.send_command(ip, {"cmd": "get.miner.status", "param": "pools"})
             pools = []
             if pools_data.get('code') == 0:
                 raw_pools = pools_data.get('msg', {}).get('pools', [])
                 for p in raw_pools:
                     pools.append({
-                        "url": p.get('url', 'N/A'),
+                        "url": p.get('pool', p.get('url', 'N/A')),
                         "worker": p.get('worker', 'N/A'),
                         "status": p.get('status', 'N/A'),
                         "passwd": '***' if p.get('passwd') else 'N/A'
                     })
     
-            if status_data.get('code') != 0 or setting_data.get('code') != 0:
+            if status_data.get('code') != 0:
                 return {"ip": ip, "online": False}
 
             summary = status_data.get('msg', {}).get('summary', {})
@@ -529,58 +517,36 @@ class DeviceMonitor:
         try:
             salt = await self.get_salt(ip)
             ts = int(time.time())
-            init_resp = await self.send_command(ip, {
+            payload = {
                 "cmd": "set.system.update_firmware",
                 "ts": ts,
                 "token": self.generate_token("set.system.update_firmware", salt, ts),
                 "account": self.current_account
-            })
-        
-            if init_resp.get('msg') != "ready":
-                raise ConnectionError("Устройство не готово к обновлению")
-
+            }
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(ip, API_PORT),
                 timeout=CONNECTION_TIMEOUT
             )
-            
-            # Вычисление CRC32 файла
+            data = json.dumps(payload, ensure_ascii=True, separators=(',', ':')).encode('ascii')
+            writer.write(len(data).to_bytes(4, 'little') + data)
+            await writer.drain()
+            length = int.from_bytes(
+                await asyncio.wait_for(reader.readexactly(4), READ_TIMEOUT), 'little'
+            )
+            if length <= 0 or length > 1024 * 1024:
+                raise CommandError(f"Invalid firmware response length: {length}")
+            init_resp = json.loads(
+                (await asyncio.wait_for(reader.readexactly(length), READ_TIMEOUT)).decode('ascii')
+            )
+            if init_resp.get('msg') != "ready":
+                raise ConnectionError("Устройство не готово к обновлению")
+
             with open(self.firmware_path, 'rb') as f:
                 firmware_data = f.read()
             firmware_size = len(firmware_data)
-            crc32 = binascii.crc32(firmware_data)
-            
-            # Отправка CRC32
-            writer.write(crc32.to_bytes(4, 'little'))
+
+            writer.write(firmware_size.to_bytes(4, 'little'))
             await writer.drain()
-    
-            # Проверка подтверждения CRC
-            try:
-                crc_confirmation = await asyncio.wait_for(reader.read(1), timeout=10)
-            except asyncio.TimeoutError:
-                raise ConnectionError("Таймаут подтверждения CRC")
-
-            if crc_confirmation != b'\x01':
-                raise ConnectionError(f"Ошибка CRC подтверждения: {crc_confirmation!r}")
-
-            confirmation_received = False
-            for attempt in range(3):
-                try:
-                    writer.write(firmware_size.to_bytes(4, 'little'))
-                    await writer.drain()
-                
-                    confirmation = await asyncio.wait_for(reader.read(1), timeout=15)
-                    logging.debug(f"Попытка {attempt+1}: Ответ устройства на размер: {confirmation}")
-
-                    if confirmation == b'\x01':
-                        confirmation_received = True
-                        break
-                    logging.warning(f"Попытка {attempt+1}: Неверный ответ подтверждения: {confirmation}")
-                except asyncio.TimeoutError:
-                    logging.warning(f"Попытка {attempt+1}: Таймаут подтверждения размера")
-
-            if not confirmation_received:
-                raise ConnectionError("Ошибка подтверждения размера прошивки")
 
             # Отправка данных прошивки
             sent = 0
@@ -591,15 +557,6 @@ class DeviceMonitor:
                 sent += chunk_size
                 progress = sent / firmware_size
                 self.operation_progress[ip] = ("update", time.time(), UPDATE_DURATION, f"upload {progress:.1%}")
-
-            # Получение финального подтверждения
-            try:
-                final_confirmation = await asyncio.wait_for(reader.read(1), timeout=30)
-            except asyncio.TimeoutError:
-                raise ConnectionError("Таймаут финального подтверждения загрузки")
-
-            if final_confirmation != b'\x01':
-                raise ConnectionError(f"Ошибка подтверждения загрузки: {final_confirmation!r}")
 
             logging.info(f"{ip}: Прошивка успешно передана")
             self.operation_progress[ip] = ("update", time.time(), UPDATE_DURATION, "finalizing")
@@ -703,7 +660,7 @@ class DeviceMonitor:
                         "token": self.generate_token(payload['cmd'], salt, ts),
                         "account": self.current_account
                     })
-                    if any(cmd in payload['cmd'] for cmd in ENCRYPTED_COMMANDS):
+                    if payload['cmd'] in ENCRYPTED_COMMANDS and not isinstance(payload.get('param'), str):
                         payload['param'] = self.encrypt_param(payload['param'], payload['cmd'], salt, ts)
 
                 reader, writer = await asyncio.wait_for(
@@ -711,7 +668,9 @@ class DeviceMonitor:
                     timeout=CONNECTION_TIMEOUT
                 )
                 
-                data = json.dumps(payload, ensure_ascii=False).encode()
+                data = json.dumps(payload, ensure_ascii=True, separators=(',', ':')).encode('ascii')
+                if len(data) > 1024 * 1024:
+                    raise CommandError("Command payload is too large")
                 writer.write(len(data).to_bytes(4, 'little'))
                 await writer.drain()
                 writer.write(data)
@@ -719,6 +678,8 @@ class DeviceMonitor:
 
                 length_bytes = await asyncio.wait_for(reader.readexactly(4), READ_TIMEOUT)
                 length = int.from_bytes(length_bytes, 'little')
+                if length <= 0 or length > 1024 * 1024:
+                    raise CommandError(f"Invalid response length: {length}")
                 response_data = await asyncio.wait_for(reader.readexactly(length), READ_TIMEOUT)
                 return json.loads(response_data.decode())
                 
@@ -787,15 +748,11 @@ class DeviceMonitor:
 
     def validate_frequency(self, freq: int) -> bool:
         """Валидировать значение частоты"""
-        return 50 <= freq <= 100
-
-    def validate_voltage(self, voltage: int) -> bool:
-        """Валидировать значение напряжения"""
-        return 700 <= voltage <= 1000
+        return -100 <= freq <= 100
 
     def validate_power(self, power: int) -> bool:
         """Валидировать значение мощности"""
-        return 100 <= power <= 3000  # Для M50S
+        return 0 <= power <= 99999
 
     async def cleanup(self):
         self.monitor_running = False
@@ -898,97 +855,14 @@ class DeviceMonitor:
         finally:
             curses.noecho()
 
-    async def _set_voltage_dialog(self, stdscr):
-        """Диалог для установки напряжения"""
-        h, w = stdscr.getmaxyx()
-        win = curses.newwin(5, 40, h//2-2, w//2-20)
-        win.border()
-        win.addstr(1, 2, "Напряжение (700-1000 мВ):")
-        curses.echo()
-        win.refresh()
-        
-        try:
-            voltage = int(self._get_input(win, 2, 2, 10))
-            if self.validate_voltage(voltage):
-                await self.set_voltage(voltage)
-            else:
-                logging.error(f"Некорректное напряжение: {voltage}. Допустимый диапазон: 700-1000 мВ")
-        except (ValueError, ValidationError) as e:
-            logging.error(f"Ошибка при установке напряжения: {str(e)}")
-        finally:
-            curses.noecho()
-
-    async def _get_logs_dialog(self, stdscr):
-        """Диалог для получения логов"""
-        if self.selected_devices:
-            ip = list(self.selected_devices)[0]
-            logs = await self.get_system_logs(ip, lines=50)
-            
-            h, w = stdscr.getmaxyx()
-            win = curses.newwin(h-4, w-2, 2, 1)
-            win.border()
-            
-            for i, log in enumerate(logs[:h-6]):
-                try:
-                    win.addstr(1+i, 1, str(log)[:w-4], curses.color_pair(7))
-                except curses.error:
-                    pass
-            
-            win.addstr(h-3, 1, "[Нажмите любую клавишу для возврата]")
-            win.refresh()
-            win.getch()
-
-    async def _show_hashboard_info(self):
-        """Показать информацию о хеш-платах"""
-        if not self.selected_devices:
-            return
-        
-        for ip in self.selected_devices:
-            info = await self.get_hashboard_info(ip)
-            temps = await self.get_chip_temperatures(ip)
-            logging.info(f"{ip}: Информация о хеш-платах: {json.dumps(info, ensure_ascii=False)}")
-            if temps:
-                logging.info(f"{ip}: Температуры чипов: {json.dumps(temps, ensure_ascii=False)}")
-
-    async def _backup_config_dialog(self, stdscr):
-        """Диалог для резервной копии конфигурации"""
-        if not self.selected_devices:
-            return
-        
-        for ip in self.selected_devices:
-            await self.backup_configuration(ip)
-
-    async def _change_password_dialog(self, stdscr):
-        """Диалог для изменения пароля"""
-        h, w = stdscr.getmaxyx()
-        win = curses.newwin(5, 50, h//2-2, w//2-25)
-        win.border()
-        win.addstr(1, 2, "Введите новый пароль:")
-        curses.echo()
-        win.refresh()
-        
-        try:
-            password = self._get_input(win, 2, 2, 40)
-            if password:
-                await self.change_password(password)
-        finally:
-            curses.noecho()
-
     async def set_pools(self, pools: List[Dict]):
         if not self.selected_devices:
             return
 
         for ip in self.selected_devices:
-            salt = await self.get_salt(ip)
-            ts = int(time.time())
-            encrypted_param = self.encrypt_param(pools, "set.miner.pools", salt, ts)
-            
             response = await self.send_command(ip, {
                 "cmd": "set.miner.pools",
-                "ts": ts,
-                "token": self.generate_token("set.miner.pools", salt, ts),
-                "account": self.current_account,
-                "param": encrypted_param
+                "param": pools
             })
             if response.get('code') == 0:
                 logging.info(f"{ip}: Пулы успешно обновлены")
@@ -1082,38 +956,6 @@ class DeviceMonitor:
             else:
                 logging.error(f"{ip}: Ошибка сброса настроек")
 
-    # ============== НОВЫЕ ФУНКЦИИ ДЛЯ WHATSMINER M50S ==============
-
-    async def get_chip_temperatures(self, ip: str) -> Dict:
-        """Получить температуры отдельных чипов"""
-        try:
-            response = await self.send_command(ip, {
-                "cmd": "get.miner.status",
-                "param": "chip"
-            })
-            if response.get('code') == 0:
-                return response.get('msg', {})
-            logging.error(f"{ip}: Ошибка получения температур чипов")
-            return {}
-        except Exception as e:
-            logging.error(f"{ip}: Ошибка получения температур чипов: {str(e)}")
-            return {}
-
-    async def get_hashboard_info(self, ip: str) -> Dict:
-        """Получить информацию о хеш-платах"""
-        try:
-            response = await self.send_command(ip, {
-                "cmd": "get.miner.status",
-                "param": "hashboard"
-            })
-            if response.get('code') == 0:
-                return response.get('msg', {})
-            logging.error(f"{ip}: Ошибка получения информации о хеш-платах")
-            return {}
-        except Exception as e:
-            logging.error(f"{ip}: Ошибка получения информации о хеш-платах: {str(e)}")
-            return {}
-
     async def set_frequency(self, frequency: int) -> bool:
         """Установить частоту майнинга (в процентах от базовой)"""
         if not self.selected_devices:
@@ -1142,264 +984,6 @@ class DeviceMonitor:
                     logging.error(f"{ip}: Ошибка установки частоты: {response.get('msg')}")
             except Exception as e:
                 logging.error(f"{ip}: Ошибка установки частоты: {str(e)}")
-
-        return success_count > 0
-
-    async def set_voltage(self, voltage: int) -> bool:
-        """Установить напряжение (в милливольтах)"""
-        if not self.selected_devices:
-            return False
-
-        if not self.validate_voltage(voltage):
-            logging.error(f"Неверное напряжение {voltage}. Допустимый диапазон: 700-1000 мВ")
-            raise ValidationError(f"Неверное напряжение: {voltage}")
-
-        success_count = 0
-        for ip in self.selected_devices:
-            try:
-                salt = await self.get_salt(ip)
-                ts = int(time.time())
-                response = await self.send_command(ip, {
-                    "cmd": "set.miner.voltage",
-                    "ts": ts,
-                    "token": self.generate_token("set.miner.voltage", salt, ts),
-                    "account": self.current_account,
-                    "param": voltage
-                })
-                if response.get('code') == 0:
-                    logging.info(f"{ip}: Напряжение установлено на {voltage} мВ")
-                    success_count += 1
-                else:
-                    logging.error(f"{ip}: Ошибка установки напряжения: {response.get('msg')}")
-            except Exception as e:
-                logging.error(f"{ip}: Ошибка установки напряжения: {str(e)}")
-
-        return success_count > 0
-
-    async def get_system_logs(self, ip: str, lines: int = 100) -> List[str]:
-        """Получить логи системы"""
-        try:
-            response = await self.send_command(ip, {
-                "cmd": "get.system.logs",
-                "param": {"count": lines}
-            })
-            if response.get('code') == 0:
-                logs = response.get('msg', {}).get('logs', [])
-                logging.info(f"{ip}: Получено {len(logs)} строк логов")
-                return logs
-            logging.error(f"{ip}: Ошибка получения логов")
-            return []
-        except Exception as e:
-            logging.error(f"{ip}: Ошибка получения логов: {str(e)}")
-            return []
-
-    async def reset_statistics(self) -> bool:
-        """Сброс статистики майнинга"""
-        if not self.selected_devices:
-            return False
-
-        success_count = 0
-        for ip in self.selected_devices:
-            try:
-                salt = await self.get_salt(ip)
-                ts = int(time.time())
-                response = await self.send_command(ip, {
-                    "cmd": "set.system.reset_statistics",
-                    "ts": ts,
-                    "token": self.generate_token("set.system.reset_statistics", salt, ts),
-                    "account": self.current_account
-                })
-                if response.get('code') == 0:
-                    logging.info(f"{ip}: Статистика сброшена")
-                    success_count += 1
-                else:
-                    logging.error(f"{ip}: Ошибка сброса статистики")
-            except Exception as e:
-                logging.error(f"{ip}: Ошибка сброса статистики: {str(e)}")
-
-        return success_count > 0
-
-    async def backup_configuration(self, ip: str, filename: str = None) -> bool:
-        """Создать резервную копию конфигурации"""
-        try:
-            if filename is None:
-                filename = f"config_backup_{ip}_{int(time.time())}.json"
-
-            response = await self.send_command(ip, {
-                "cmd": "get.miner.config"
-            })
-            
-            if response.get('code') == 0:
-                config_data = response.get('msg', {})
-                with open(filename, 'w') as f:
-                    json.dump(config_data, f, indent=2, ensure_ascii=False)
-                logging.info(f"{ip}: Конфигурация сохранена в {filename}")
-                return True
-            else:
-                logging.error(f"{ip}: Ошибка получения конфигурации")
-                return False
-        except Exception as e:
-            logging.error(f"{ip}: Ошибка создания резервной копии: {str(e)}")
-            return False
-
-    async def restore_configuration(self, ip: str, filename: str) -> bool:
-        """Восстановить конфигурацию из резервной копии"""
-        try:
-            if not os.path.exists(filename):
-                logging.error(f"Файл конфигурации {filename} не найден")
-                return False
-
-            with open(filename, 'r') as f:
-                config_data = json.load(f)
-
-            salt = await self.get_salt(ip)
-            ts = int(time.time())
-            
-            # Шифруем конфигурацию если требуется
-            encrypted_param = self.encrypt_param(config_data, "set.miner.config", salt, ts)
-            
-            response = await self.send_command(ip, {
-                "cmd": "set.miner.config",
-                "ts": ts,
-                "token": self.generate_token("set.miner.config", salt, ts),
-                "account": self.current_account,
-                "param": encrypted_param
-            })
-            
-            if response.get('code') == 0:
-                logging.info(f"{ip}: Конфигурация восстановлена")
-                return True
-            else:
-                logging.error(f"{ip}: Ошибка восстановления конфигурации")
-                return False
-        except Exception as e:
-            logging.error(f"{ip}: Ошибка восстановления конфигурации: {str(e)}")
-            return False
-
-    async def get_usb_devices_info(self, ip: str) -> List[Dict]:
-        """Получить информацию об USB-устройствах"""
-        try:
-            response = await self.send_command(ip, {
-                "cmd": "get.system.usb"
-            })
-            
-            if response.get('code') == 0:
-                usb_devices = response.get('msg', {}).get('devices', [])
-                logging.info(f"{ip}: Получена информация о {len(usb_devices)} USB-устройствах")
-                return usb_devices
-            else:
-                logging.error(f"{ip}: Ошибка получения информации об USB-устройствах")
-                return []
-        except Exception as e:
-            logging.error(f"{ip}: Ошибка получения информации об USB-устройствах: {str(e)}")
-            return []
-
-    async def set_auto_recovery(self, enabled: bool = True) -> bool:
-        """Включить/отключить автоматическое восстановление"""
-        if not self.selected_devices:
-            return False
-
-        success_count = 0
-        for ip in self.selected_devices:
-            try:
-                salt = await self.get_salt(ip)
-                ts = int(time.time())
-                response = await self.send_command(ip, {
-                    "cmd": "set.system.auto_recovery",
-                    "ts": ts,
-                    "token": self.generate_token("set.system.auto_recovery", salt, ts),
-                    "account": self.current_account,
-                    "param": 1 if enabled else 0
-                })
-                if response.get('code') == 0:
-                    status = "включено" if enabled else "отключено"
-                    logging.info(f"{ip}: Автоматическое восстановление {status}")
-                    success_count += 1
-                else:
-                    logging.error(f"{ip}: Ошибка установки автоматического восстановления")
-            except Exception as e:
-                logging.error(f"{ip}: Ошибка установки автоматического восстановления: {str(e)}")
-
-        return success_count > 0
-
-    async def get_performance_stats(self, ip: str) -> Dict:
-        """Получить расширенную статистику производительности"""
-        try:
-            response = await self.send_command(ip, {
-                "cmd": "get.miner.status",
-                "param": "performance"
-            })
-            
-            if response.get('code') == 0:
-                return response.get('msg', {})
-            else:
-                logging.error(f"{ip}: Ошибка получения статистики производительности")
-                return {}
-        except Exception as e:
-            logging.error(f"{ip}: Ошибка получения статистики производительности: {str(e)}")
-            return {}
-
-    async def change_password(self, new_password: str) -> bool:
-        """Изменить пароль аккаунта"""
-        if not self.selected_devices or not new_password:
-            return False
-
-        success_count = 0
-        for ip in self.selected_devices:
-            try:
-                salt = await self.get_salt(ip)
-                ts = int(time.time())
-                
-                encrypted_pass = self.encrypt_param(
-                    new_password,
-                    "set.user.change_passwd",
-                    salt,
-                    ts
-                )
-                
-                response = await self.send_command(ip, {
-                    "cmd": "set.user.change_passwd",
-                    "ts": ts,
-                    "token": self.generate_token("set.user.change_passwd", salt, ts),
-                    "account": self.current_account,
-                    "param": encrypted_pass
-                })
-                
-                if response.get('code') == 0:
-                    logging.info(f"{ip}: Пароль успешно изменен")
-                    success_count += 1
-                else:
-                    logging.error(f"{ip}: Ошибка изменения пароля: {response.get('msg')}")
-            except Exception as e:
-                logging.error(f"{ip}: Ошибка изменения пароля: {str(e)}")
-
-        return success_count > 0
-
-    async def enable_thermal_throttling(self, enabled: bool = True) -> bool:
-        """Включить/отключить тепловое ограничение"""
-        if not self.selected_devices:
-            return False
-
-        success_count = 0
-        for ip in self.selected_devices:
-            try:
-                salt = await self.get_salt(ip)
-                ts = int(time.time())
-                response = await self.send_command(ip, {
-                    "cmd": "set.system.thermal_throttling",
-                    "ts": ts,
-                    "token": self.generate_token("set.system.thermal_throttling", salt, ts),
-                    "account": self.current_account,
-                    "param": 1 if enabled else 0
-                })
-                if response.get('code') == 0:
-                    status = "включено" if enabled else "отключено"
-                    logging.info(f"{ip}: Тепловое ограничение {status}")
-                    success_count += 1
-                else:
-                    logging.error(f"{ip}: Ошибка установки теплового ограничения")
-            except Exception as e:
-                logging.error(f"{ip}: Ошибка установки теплового ограничения: {str(e)}")
 
         return success_count > 0
 

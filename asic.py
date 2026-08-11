@@ -1011,6 +1011,7 @@ def main():
     parser = argparse.ArgumentParser(description="Мониторинг ASIC-устройств")
     parser.add_argument("--scan", help="Диапазон сети для сканирования")
     parser.add_argument("--firmware", default=DEFAULT_FIRMWARE, help="Путь к файлу прошивки")
+    parser.add_argument("--telegram", action="store_true", help="Запустить Telegram-бота вместо curses-интерфейса")
     args = parser.parse_args()
 
     if not args.scan and not os.path.exists(CONFIG_FILE):
@@ -1020,6 +1021,11 @@ def main():
     devices = asyncio.run(scan_network(args.scan)) if args.scan else load_devices()
     monitor = DeviceMonitor(devices)
     monitor.firmware_path = args.firmware
+
+    if args.telegram:
+        from telegram_bot import run_telegram_bot
+        run_telegram_bot(monitor)
+        return
 
     def curses_main(stdscr):
         try:

@@ -41,7 +41,7 @@ ASIC Monitor is a command-line interface (CLI) tool designed to monitor and mana
     pip install -r requirements.txt
     ```
 
-4.  **Configure Accounts**:
+4.  **Configure Accounts and Telegram (optional)**:
     Create a `.env` file in the project root and add your ASIC device account passwords. By default, the script uses a "super" account and three "user" accounts.
     ```
     SUPER_PASSWORD="your_super_password"
@@ -49,7 +49,17 @@ ASIC Monitor is a command-line interface (CLI) tool designed to monitor and mana
     USER2_PASSWORD="your_user2_password"
     USER3_PASSWORD="your_user3_password"
     ```
+
     Ensure you replace `"your_super_password"` etc. with your actual passwords.
+    To enable the Telegram interface, also add the bot token from
+    [@BotFather](https://t.me/BotFather) and the numeric Telegram user IDs that
+    may control the miners:
+    ```
+    TELEGRAM_BOT_TOKEN="123456:your_bot_token"
+    TELEGRAM_ALLOWED_USER_IDS="123456789,987654321"
+    ```
+    Never publish the token. An allowlist is required; an empty allowlist
+    prevents the bot from starting.
 
 5.  **Place Firmware File (for updates)**:
     If you plan to use the firmware update feature, place your firmware `.bin` file in the same directory as `asic.py` or specify its path using the `--firmware` argument. The default firmware file name is `firmware.bin`.
@@ -75,6 +85,16 @@ ASIC Monitor is a command-line interface (CLI) tool designed to monitor and mana
     ```bash
     python3 asic.py --firmware /path/to/your/firmware_file.bin
     ```
+
+4.  **Start the Telegram bot**:
+    ```bash
+    python3 asic.py --telegram
+    ```
+    The bot supports `/status`, `/devices`, `/reboot`, `/frequency`,
+    `/power`, and `/fan`. Commands that omit IP addresses apply to all
+    configured devices. Use `/help` in Telegram for syntax. If the bot does
+    not answer, send `/whoami`, copy the shown numeric ID into
+    `TELEGRAM_ALLOWED_USER_IDS`, and restart the bot.
 
 ## Key Bindings
 

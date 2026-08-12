@@ -16,7 +16,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from asic import DeviceMonitor, DeviceError, ValidationError
+from asic import DeviceMonitor, DeviceError, ValidationError, OVERHEAT_TEMP
 
 
 T = TypeVar("T")
@@ -67,20 +67,47 @@ def _selected_devices(monitor: DeviceMonitor, arguments: List[str]) -> Set[str]:
     return devices
 
 
-def _device_line(device: dict) -> str:
-    status = "ON" if device.get("online") else "OFF"
+def _status_summary(devices: List[dict]) -> str:
+    online = [d for d in devices if d.get("online")]
+    total_hashrate = sum(d.get("hashrate", 0) for d in online)
+    total_power = sum(d.get("power", 0) for d in online)
+    avg_temp = (
+        sum(d.get("temp", 0) for d in online) / len(online)
+        if online
+        else 0
+    )
+    online_count = len(online)
+    offline_count = len(devices) - online_count
+
     return (
-        f"{html.escape(device['ip'])}: {status}, "
-        f"{device.get('temp', 0):.1f}°C, "
-        f"{device.get('hashrate', 0):.1f} TH/s, "
-        f"{device.get('power', 0) / 1000:.1f} kW"
+        "<b>Статус устройств</b>\n"
+        f"Устройств: <b>{len(devices)}</b> (ON: <b>{online_count}</b>, OFF: <b>{offline_count}</b>)\n"
+        f"Хэшрейт: <b>{total_hashrate:.1f}</b> TH/s | "
+        f"Потребление: <b>{total_power / 1000:.1f}</b> kW | "
+        f"Средняя темп.: <b>{avg_temp:.1f}</b>°C\n"
+    )
+
+
+def _device_line(device: dict, index: int) -> str:
+    status = "ON" if device.get("online") else "OFF"
+    temp = device.get("temp", 0)
+    hashrate = device.get("hashrate", 0)
+    power = device.get("power", 0) / 1000
+    warning = " ❗" if temp > OVERHEAT_TEMP else ""
+    return (
+        f"{index}. <code>{html.escape(device['ip'])}</code> — "
+        f"<b>{status}</b> | "
+        f"{hashrate:.1f} TH/s | "
+        f"{temp:.1f}°C | "
+        f"{power:.1f} kW{warning}"
     )
 
 
 def _help_text() -> str:
     return (
         "<b>Команды</b>\n"
-        "/status [IP ...] — состояние устройств\n"
+        "/status [IP ...] — состояние устройств, сортировка по хэшрейту\n"
+        "/devices [IP ...] — alias для /status\n"
         "/reboot [IP ...] — перезагрузить устройства\n"
         "/frequency &lt;-100..100&gt; [IP ...] — установить частоту\n"
         "/power &lt;0..99999&gt; [IP ...] — установить лимит мощности\n"
@@ -114,8 +141,27 @@ class TelegramBot:
         try:
             devices = _selected_devices(self.monitor, context.args)
             results = await self._get_devices(devices)
-            text = "\n".join(_device_line(device) for device in results)
-            await update.effective_message.reply_text(text or "Нет данных.")
+            results = sorted(results, key=lambda d: d.get("hashrate", 0), reverse=True)
+            if not results:
+                await update.effective_message.reply_text("Нет данных.")
+                return
+
+            overheat_devices = [d for d in results if d.get("temp", 0) > OVERHEAT_TEMP]
+            message = _status_summary(results)
+            if overheat_devices:
+                names = ", ".join(html.escape(d["ip"]) for d in overheat_devices)
+                message += (
+                    f"<b>ВНИМАНИЕ:</b> превышение температуры на устройствах: {names}.\n"
+                )
+            message += "\n".join(
+                _device_line(device, idx + 1)
+                for idx, device in enumerate(results)
+            )
+            await update.effective_message.reply_text(
+                message,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
         except ValueError as exc:
             await update.effective_message.reply_text(str(exc))
 

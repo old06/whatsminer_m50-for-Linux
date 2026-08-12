@@ -92,6 +92,7 @@ ASIC Monitor is a command-line interface (CLI) tool designed to monitor and mana
     ```
     The bot supports `/status`, `/devices`, `/reboot`, `/frequency`,
     `/power`, and `/fan`.
+<<<<<<< HEAD
     `/status` returns a nicely formatted list, sorts devices by hashrate, and shows total hashrate, power consumption, and average temperature.
     When a temperature threshold is exceeded, it includes an overheat warning.
 
@@ -108,6 +109,12 @@ ASIC Monitor is a command-line interface (CLI) tool designed to monitor and mana
 
     Commands without IP list apply to all configured devices.
     Use `/help` in Telegram for syntax. If the bot does not respond, send `/whoami`, copy the numeric ID into `TELEGRAM_ALLOWED_USER_IDS`, and restart the bot.
+=======
+    `/status` возвращает красиво отформатированный список, сортирует устройства по хэшрейту и показывает общий хэшрейт, потребление и среднюю температуру.
+    При превышении температуры по умолчанию выводит предупреждение о перегреве.
+    Команды, которые не указывают IP, применяются ко всем настроенным устройствам.
+    Используйте `/help` в Telegram для синтаксиса. Если бот не отвечает, отправьте `/whoami`, скопируйте показанный числовой ID в `TELEGRAM_ALLOWED_USER_IDS` и перезапустите бота.
+>>>>>>> 3f681e167910f0e5766de3beb69b190f4ec33a80
 
 ## Key Bindings
 

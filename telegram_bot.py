@@ -80,19 +80,11 @@ def _status_summary(devices: List[dict]) -> str:
     offline_count = len(devices) - online_count
 
     return (
-<<<<<<< HEAD
         "<b>Device Status</b>\n"
         f"Devices: <b>{len(devices)}</b> (ON: <b>{online_count}</b>, OFF: <b>{offline_count}</b>)\n"
         f"Hashrate: <b>{total_hashrate:.1f}</b> TH/s | "
         f"Power: <b>{total_power / 1000:.1f}</b> kW | "
         f"Average temp: <b>{avg_temp:.1f}</b>°C\n"
-=======
-        "<b>Статус устройств</b>\n"
-        f"Устройств: <b>{len(devices)}</b> (ON: <b>{online_count}</b>, OFF: <b>{offline_count}</b>)\n"
-        f"Хэшрейт: <b>{total_hashrate:.1f}</b> TH/s | "
-        f"Потребление: <b>{total_power / 1000:.1f}</b> kW | "
-        f"Средняя темп.: <b>{avg_temp:.1f}</b>°C\n"
->>>>>>> 3f681e167910f0e5766de3beb69b190f4ec33a80
     )
 
 
@@ -113,7 +105,6 @@ def _device_line(device: dict, index: int) -> str:
 
 def _help_text() -> str:
     return (
-<<<<<<< HEAD
         "<b>Commands</b>\n"
         "/status [IP ...] — device status, sorted by hashrate\n"
         "/devices [IP ...] — alias for /status\n"
@@ -123,17 +114,6 @@ def _help_text() -> str:
         "/fan &lt;normal|zero&gt; [IP ...] — set fan mode\n"
         "/help — this help\n\n"
         "Without IP list, command applies to all devices."
-=======
-        "<b>Команды</b>\n"
-        "/status [IP ...] — состояние устройств, сортировка по хэшрейту\n"
-        "/devices [IP ...] — alias для /status\n"
-        "/reboot [IP ...] — перезагрузить устройства\n"
-        "/frequency &lt;-100..100&gt; [IP ...] — установить частоту\n"
-        "/power &lt;0..99999&gt; [IP ...] — установить лимит мощности\n"
-        "/fan &lt;normal|zero&gt; [IP ...] — режим вентиляторов\n"
-        "/help — эта справка\n\n"
-        "Без списка IP команда применяется ко всем устройствам."
->>>>>>> 3f681e167910f0e5766de3beb69b190f4ec33a80
     )
 
 
@@ -163,11 +143,7 @@ class TelegramBot:
             results = await self._get_devices(devices)
             results = sorted(results, key=lambda d: d.get("hashrate", 0), reverse=True)
             if not results:
-<<<<<<< HEAD
                 await update.effective_message.reply_text("No data.")
-=======
-                await update.effective_message.reply_text("Нет данных.")
->>>>>>> 3f681e167910f0e5766de3beb69b190f4ec33a80
                 return
 
             overheat_devices = [d for d in results if d.get("temp", 0) > OVERHEAT_TEMP]
@@ -175,11 +151,7 @@ class TelegramBot:
             if overheat_devices:
                 names = ", ".join(html.escape(d["ip"]) for d in overheat_devices)
                 message += (
-<<<<<<< HEAD
                     f"<b>WARNING:</b> temperature exceeded on devices: {names}.\n"
-=======
-                    f"<b>ВНИМАНИЕ:</b> превышение температуры на устройствах: {names}.\n"
->>>>>>> 3f681e167910f0e5766de3beb69b190f4ec33a80
                 )
             message += "\n".join(
                 _device_line(device, idx + 1)

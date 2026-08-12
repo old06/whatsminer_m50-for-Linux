@@ -190,6 +190,37 @@ class TelegramBot:
         )
 
     @authorized
+    async def mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            if not context.args or context.args[0] not in {"normal", "low", "high"}:
+                raise ValueError("Usage: /mode normal|low|high [IP ...]")
+            self.monitor.selected_devices = _selected_devices(self.monitor, context.args[1:])
+            await self.monitor.set_power_mode(context.args[0])
+            await update.effective_message.reply_text(
+                f"Performance mode set to {context.args[0]}."
+            )
+        except (ValueError, DeviceError) as exc:
+            await update.effective_message.reply_text(f"Error: {exc}")
+
+    @authorized
+    async def menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = (
+            "<b>Telegram Bot Menu</b>\n"
+            "Use these commands to manage ASIC devices:\n"
+            "\n"
+            "/status [IP ...] — device status, sorted by hashrate\n"
+            "/devices [IP ...] — alias for /status\n"
+            "/reboot [IP ...] — reboot devices\n"
+            "/frequency <value> [IP ...] — set frequency\n"
+            "/power <value> [IP ...] — set power limit\n"
+            "/fan normal|zero [IP ...] — set fan mode\n"
+            "/mode normal|low|high [IP ...] — set performance mode\n"
+            "/help — show help text\n"
+        )
+        await update.effective_message.reply_text(
+            message, parse_mode="HTML", disable_web_page_preview=True
+        )
+
     async def fan(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             if not context.args or context.args[0] not in {"normal", "zero"}:
@@ -264,6 +295,9 @@ def build_application(monitor: DeviceMonitor) -> Application:
     application.add_handler(CommandHandler("frequency", bot.frequency))
     application.add_handler(CommandHandler("power", bot.power))
     application.add_handler(CommandHandler("fan", bot.fan))
+    application.add_handler(CommandHandler("mode", bot.mode))
+    application.add_handler(CommandHandler("powermode", bot.mode))
+    application.add_handler(CommandHandler("menu", bot.menu))
     application.add_error_handler(_error_handler)
     return application
 

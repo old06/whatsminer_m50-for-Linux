@@ -35,7 +35,7 @@ COMMAND_RETRIES = 3
 CONNECTION_TIMEOUT = 15
 READ_TIMEOUT = 50
 CHUNK_SIZE = 4096
-DEFAULT_FIRMWARE = "firmware.bin"
+DEFAULT_FIRMWARE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "firmware.bin")
 ENCRYPTED_COMMANDS = {'set.miner.pools', 'set.user.change_passwd', 'set.miner.power_percent'}
 OVERHEAT_TEMP = 80  # Температура перегрева
 
@@ -505,8 +505,12 @@ class DeviceMonitor:
         if not self.selected_devices:
             return
 
-        if not os.path.exists(self.firmware_path):
-            logging.error(f"Файл прошивки {self.firmware_path} не найден!")
+        if not os.path.isfile(self.firmware_path) or not os.access(self.firmware_path, os.R_OK):
+            logging.error(f"Файл прошивки недоступен для чтения: {self.firmware_path}")
+            return
+
+        if os.path.getsize(self.firmware_path) == 0:
+            logging.error(f"Файл прошивки пуст: {self.firmware_path}")
             return
 
         logging.info(f"Инициировано обновление {len(self.selected_devices)} устройств")

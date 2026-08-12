@@ -104,7 +104,7 @@ ASIC Monitor is a command-line interface (CLI) tool designed to monitor and mana
     3. <code>192.168.1.103</code> — <b>OFF</b> | 0.0 TH/s | 0.0°C | 0.0 kW
     ```
 
-    Commands without IP list apply to all configured devices.
+    Commands without an IP list apply to all configured devices.
     Use `/help` in Telegram for syntax. If the bot does not respond, send `/whoami`, copy the numeric ID into `TELEGRAM_ALLOWED_USER_IDS`, and restart the bot.
 
 ## Key Bindings
@@ -116,9 +116,9 @@ ASIC Monitor is a command-line interface (CLI) tool designed to monitor and mana
 | `A`         | Select/Deselect All              | Toggle selection for all listed devices         |
 | `R`         | Reboot Devices                   | Initiate a reboot for all selected devices      |
 | `U`         | Update Firmware                  | Initiate a firmware update for selected devices |
-| `P`         | Pause Monitoring                 | Pause/Resume real-time data updates             |
-| `F`         | Fan Control Menu                 | Access menu for fan speed settings              |
-| `L`         | Set LED Mode                     | Change LED indicator settings                   |
+| `p`         | Pause Monitoring                 | Pause/Resume real-time data updates             |
+| `f`         | Fan Control Menu                 | Access menu for fan speed settings              |
+| `l`         | Set LED Mode                     | Change LED indicator settings                   |
 | `M`         | Power Mode Menu                  | Access menu for power modes (normal, economic, high) |
 | `L`         | Set Power Limit                  | Set a power consumption limit (0-99999 W)       |
 | `P`         | Set Pools                        | Configure mining pool settings                  |

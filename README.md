@@ -92,22 +92,22 @@ ASIC Monitor is a command-line interface (CLI) tool designed to monitor and mana
     ```
     The bot supports `/status`, `/devices`, `/reboot`, `/frequency`,
     `/power`, and `/fan`.
-    `/status` возвращает красиво отформатированный список, сортирует устройства по хэшрейту и показывает общий хэшрейт, потребление и среднюю температуру.
-    При превышении температуры по умолчанию выводит предупреждение о перегреве.
+    `/status` returns a nicely formatted list, sorts devices by hashrate, and shows total hashrate, power consumption, and average temperature.
+    When a temperature threshold is exceeded, it includes an overheat warning.
 
-    Пример вывода `/status`:
+    Example `/status` output:
     ```text
-    Статус устройств
-    Устройств: 3 (ON: 2, OFF: 1)
-    Хэшрейт: 93.5 TH/s | Потребление: 6.8 kW | Средняя темп.: 72.3°C
-    ❗ превышение температуры на устройствах: 192.168.1.102.
+    Device Status
+    Devices: 3 (ON: 2, OFF: 1)
+    Hashrate: 93.5 TH/s | Power: 6.8 kW | Average temp: 72.3°C
+    WARNING: temperature exceeded on devices: 192.168.1.102.
     1. <code>192.168.1.101</code> — <b>ON</b> | 50.0 TH/s | 69.0°C | 3.4 kW
     2. <code>192.168.1.102</code> — <b>ON</b> | 43.5 TH/s | 75.6°C | 3.4 kW ❗
     3. <code>192.168.1.103</code> — <b>OFF</b> | 0.0 TH/s | 0.0°C | 0.0 kW
     ```
 
-    Команды, которые не указывают IP, применяются ко всем настроенным устройствам.
-    Используйте `/help` в Telegram для синтаксиса. Если бот не отвечает, отправьте `/whoami`, скопируйте показанный числовой ID в `TELEGRAM_ALLOWED_USER_IDS` и перезапустите бота.
+    Commands without IP list apply to all configured devices.
+    Use `/help` in Telegram for syntax. If the bot does not respond, send `/whoami`, copy the numeric ID into `TELEGRAM_ALLOWED_USER_IDS`, and restart the bot.
 
 ## Key Bindings
 

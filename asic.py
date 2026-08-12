@@ -989,12 +989,12 @@ class DeviceMonitor:
 
 async def scan_network(network: str) -> List[str]:
     nm = nmap.PortScanner()
-    print(f"Сканирование {network}...")
+    print(f"Scanning {network}...")
     await asyncio.to_thread(nm.scan, network, arguments=f'-p {API_PORT} --open')
     devices = [host for host in nm.all_hosts() if nm[host]['tcp'][API_PORT]['state'] == 'open']
     with open(CONFIG_FILE, 'w') as f:
         json.dump(devices, f)
-    print(f"Найдено устройств: {len(devices)}")
+    print(f"Devices found: {len(devices)}")
     return devices
 
 def load_devices() -> List[str]:
@@ -1004,14 +1004,14 @@ def load_devices() -> List[str]:
                 return json.load(f)
         return []
     except Exception as e:
-        logging.error(f"Ошибка загрузки устройств: {str(e)}")
+        logging.error(f"Failed to load devices: {str(e)}")
         return []
 
 def main():
-    parser = argparse.ArgumentParser(description="Мониторинг ASIC-устройств")
-    parser.add_argument("--scan", help="Диапазон сети для сканирования")
-    parser.add_argument("--firmware", default=DEFAULT_FIRMWARE, help="Путь к файлу прошивки")
-    parser.add_argument("--telegram", action="store_true", help="Запустить Telegram-бота вместо curses-интерфейса")
+    parser = argparse.ArgumentParser(description="ASIC device monitoring")
+    parser.add_argument("--scan", help="Network range to scan")
+    parser.add_argument("--firmware", default=DEFAULT_FIRMWARE, help="Path to firmware file")
+    parser.add_argument("--telegram", action="store_true", help="Start Telegram bot instead of curses UI")
     args = parser.parse_args()
 
     if not args.scan and not os.path.exists(CONFIG_FILE):

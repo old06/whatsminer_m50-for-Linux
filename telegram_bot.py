@@ -29,7 +29,7 @@ def _allowed_user_ids() -> Set[int]:
         return {int(value.strip()) for value in raw_ids.split(",") if value.strip()}
     except ValueError as exc:
         raise ValueError(
-            "TELEGRAM_ALLOWED_USER_IDS должен содержать только числовые Telegram ID"
+            "TELEGRAM_ALLOWED_USER_IDS must contain only numeric Telegram IDs"
         ) from exc
 
 
@@ -61,9 +61,9 @@ def _selected_devices(monitor: DeviceMonitor, arguments: List[str]) -> Set[str]:
     devices = set(arguments) if arguments else set(monitor.devices)
     invalid = devices - set(monitor.devices)
     if invalid:
-        raise ValueError(f"Неизвестные устройства: {', '.join(sorted(invalid))}")
+        raise ValueError(f"Unknown devices: {', '.join(sorted(invalid))}")
     if not devices:
-        raise ValueError("Список устройств пуст. Сначала выполните сканирование сети.")
+        raise ValueError("Device list is empty. Scan the network first.")
     return devices
 
 
@@ -128,8 +128,8 @@ class TelegramBot:
         user = update.effective_user
         if update.effective_message and user:
             await update.effective_message.reply_text(
-                f"Ваш Telegram user ID: {user.id}\n"
-                "Добавьте это число в TELEGRAM_ALLOWED_USER_IDS."
+                f"Your Telegram user ID: {user.id}\n"
+                "Add this number to TELEGRAM_ALLOWED_USER_IDS."
             )
 
     @authorized
@@ -143,7 +143,7 @@ class TelegramBot:
             results = await self._get_devices(devices)
             results = sorted(results, key=lambda d: d.get("hashrate", 0), reverse=True)
             if not results:
-                await update.effective_message.reply_text("Нет данных.")
+                await update.effective_message.reply_text("No data.")
                 return
 
             overheat_devices = [d for d in results if d.get("temp", 0) > OVERHEAT_TEMP]
@@ -172,7 +172,7 @@ class TelegramBot:
             await self.monitor._init_async_resources()
             await self.monitor.reboot_devices()
             await update.effective_message.reply_text(
-                f"Перезагрузка поставлена в очередь: {len(self.monitor.selected_devices)}."
+                f"Reboot queued for {len(self.monitor.selected_devices)} device(s)."
             )
         except ValueError as exc:
             await update.effective_message.reply_text(str(exc))
@@ -180,13 +180,13 @@ class TelegramBot:
     @authorized
     async def frequency(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._run_numeric_command(
-            update, context, "frequency", "частота", self.monitor.set_frequency
+            update, context, "frequency", "frequency", self.monitor.set_frequency
         )
 
     @authorized
     async def power(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._run_numeric_command(
-            update, context, "power", "лимит мощности", self.monitor.set_power_limit
+            update, context, "power", "power limit", self.monitor.set_power_limit
         )
 
     @authorized
@@ -210,13 +210,13 @@ class TelegramBot:
     ) -> None:
         try:
             if not context.args:
-                raise ValueError(f"Использование: /{command} <значение> [IP ...]")
+                raise ValueError(f"Usage: /{command} <value> [IP ...]")
             value = int(context.args[0])
             self.monitor.selected_devices = _selected_devices(self.monitor, context.args[1:])
             await operation(value)
-            await update.effective_message.reply_text(f"{name.capitalize()} установлен.")
+            await update.effective_message.reply_text(f"{name.capitalize()} set.")
         except (ValueError, ValidationError, DeviceError) as exc:
-            await update.effective_message.reply_text(f"Ошибка: {exc}")
+            await update.effective_message.reply_text(f"Error: {exc}")
 
     async def _get_devices(self, devices: Set[str]) -> List[dict]:
         results = await asyncio.gather(
@@ -228,10 +228,10 @@ class TelegramBot:
 def build_application(monitor: DeviceMonitor) -> Application:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     if not token:
-        raise ValueError("Не задан TELEGRAM_BOT_TOKEN")
+        raise ValueError("TELEGRAM_BOT_TOKEN is not set")
     allowed_ids = _allowed_user_ids()
     if not allowed_ids:
-        raise ValueError("Не задан TELEGRAM_ALLOWED_USER_IDS")
+        raise ValueError("TELEGRAM_ALLOWED_USER_IDS is not set")
 
     bot = TelegramBot(monitor, allowed_ids)
 
@@ -240,8 +240,8 @@ def build_application(monitor: DeviceMonitor) -> Application:
         await monitor._init_async_resources()
         bot_info = await application.bot.get_me()
         print(
-            f"Telegram-бот @{bot_info.username or bot_info.id} запущен. "
-            "Ожидание команд...",
+            f"Telegram bot @{bot_info.username or bot_info.id} started. "
+            "Waiting for commands...",
             flush=True,
         )
 
@@ -289,6 +289,6 @@ def run_telegram_bot(monitor: DeviceMonitor) -> None:
         application.run_polling()
     except Exception:
         logging.exception(
-            "Не удалось запустить Telegram-бота. Проверьте токен и подключение к Telegram."
+            "Failed to start Telegram bot. Check token and Telegram connectivity."
         )
         raise

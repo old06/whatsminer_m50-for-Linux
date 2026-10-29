@@ -38,6 +38,183 @@ CHUNK_SIZE = 4096
 DEFAULT_FIRMWARE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "firmware.bin")
 ENCRYPTED_COMMANDS = {'set.miner.pools', 'set.user.change_passwd', 'set.miner.power_percent'}
 OVERHEAT_TEMP = 80  # Температура перегрева
+ERROR_CODE_INFO = {
+    "110": ("Ошибка скорости входного вентилятора", 10),
+    "111": ("Ошибка скорости выходного вентилятора", 10),
+    "120": ("Отклонение скорости входного вентилятора >2000", 3),
+    "121": ("Отклонение скорости выходного вентилятора >2000", 3),
+    "130": ("Отклонение скорости входного вентилятора >3000", 3),
+    "131": ("Отклонение скорости выходного вентилятора >3000", 3),
+    "140": ("Слишком высокая скорость вентилятора", 0),
+    "200": ("Не обнаружено питание", 10),
+    "201": ("Блок питания не соответствует конфигурации", 10),
+    "202": ("Ошибка выходного напряжения БП", 10),
+    "203": ("Защита питания", 10),
+    "204": ("Защита по току питания", 10),
+    "205": ("Ошибка тока питания", 10),
+    "206": ("Низкое входное напряжение", 10),
+    "207": ("Защита по входному току", 10),
+    "208": ("Нестабильная работа БП", 10),
+    "209": ("Резкое отклонение напряжения БП", 10),
+    "210": ("Ошибка состояния БП", 10),
+    "211": ("Большое отклонение выходного тока", 0),
+    "212": ("Недостаточный запас выходного напряжения", 3),
+    "213": ("Несоответствие входного напряжения и тока", 0),
+    "214": ("Не изменился контакт питания", 10),
+    "215": ("Ошибка установки выходного напряжения БП", 10),
+    "216": ("Питание долго не менялось", 10),
+    "217": ("Ошибка включения питания", 10),
+    "218": ("Входное напряжение ниже 230 В в мощном режиме", 2),
+    "219": ("Некорректный входной ток", 10),
+    "233": ("Перегрев выхода БП", 10),
+    "234": ("Перегрев выхода БП", 10),
+    "235": ("Перегрев выхода БП", 10),
+    "236": ("Защита выхода БП от перегрузки по току", 10),
+    "237": ("Защита выхода БП от перегрузки по току", 10),
+    "238": ("Защита выхода БП от перегрузки по току", 10),
+    "239": ("Перенапряжение на выходе БП", 10),
+    "240": ("Низкое напряжение на выходе БП", 10),
+    "241": ("Дисбаланс выходного тока БП", 10),
+    "243": ("Перегрев входа БП", 10),
+    "244": ("Перегрев входа БП", 10),
+    "245": ("Перегрев входа БП", 10),
+    "246": ("Перегрузка по входному току БП", 10),
+    "247": ("Перегрузка по входному току БП", 10),
+    "248": ("Перенапряжение на входе БП", 10),
+    "249": ("Перенапряжение на входе БП", 10),
+    "250": ("Низкое напряжение на входе БП", 10),
+    "251": ("Низкое напряжение на входе БП", 10),
+    "253": ("Ошибка вентилятора БП", 10),
+    "254": ("Ошибка вентилятора БП", 10),
+    "255": ("Превышена выходная мощность БП", 10),
+    "256": ("Превышена выходная мощность БП", 10),
+    "257": ("Защита первичной цепи БП от перегрузки", 10),
+    "258": ("Дисбаланс фазного напряжения БП", 10),
+    "259": ("Защита от дисбаланса фазного напряжения", 10),
+    "260": ("Дисбаланс фазного тока БП", 10),
+    "261": ("Защита от дисбаланса фазного тока", 10),
+    "263": ("Предупреждение о связи с БП", 10),
+    "264": ("Ошибка связи с БП", 10),
+    "267": ("Защита watchdog блока питания", 10),
+    "268": ("Защита выхода БП от сверхтока", 3),
+    "269": ("Защита входа БП от сверхтока", 3),
+    "270": ("Защита БП от входного перенапряжения", 3),
+    "271": ("Защита БП от низкого входного напряжения", 3),
+    "272": ("Предупреждение о высокой выходной мощности БП", 3),
+    "273": ("Предупреждение о высокой входной мощности", 3),
+    "274": ("Предупреждение о вентиляторе БП", 0),
+    "275": ("Предупреждение о перегреве БП", 0),
+    "300": ("Ошибка датчика температуры хеш-платы", 10),
+    "309": ("Не работают датчики температуры", None),
+    "320": ("Ошибка чтения температуры хеш-платы", 10),
+    "326": ("Ошибка датчика температуры жидкостного охлаждения", None),
+    "329": ("Ошибка датчика температуры контроллера", None),
+    "350": ("Защита по температуре хеш-платы", 10),
+    "360": ("Перегрев хеш-платы", 10),
+    "370": ("Сильные колебания температуры окружающей среды", 3),
+    "410": ("Ошибка чтения EEPROM хеш-платы", 10),
+    "420": ("Ошибка разбора EEPROM хеш-платы", 10),
+    "430": ("Несовпадение типа чипов", 10),
+    "440": ("Ошибка количества чипов в EEPROM", 10),
+    "450": ("Ошибка передачи данных EEPROM", 10),
+    "500": ("Нет конфигурации ПО для модели", 10),
+    "510": ("Ошибка типа майнера хеш-платы", 10),
+    "520": ("Несовпадение типа чипов хеш-платы", 10),
+    "530": ("Хеш-плата не обнаружена", 10),
+    "540": ("Ошибка чтения ID чипа", 10),
+    "550": ("Обнаружены неисправные чипы", 10),
+    "560": ("Ошибка балансировки хеш-платы", 10),
+    "570": ("Ошибка передачи данных чипа", 10),
+    "580": ("Ошибка сброса чипа", 0),
+    "590": ("Слишком низкая частота чипов", 5),
+    "600": ("Высокая температура окружающей среды", 10),
+    "610": ("Для режима высокой мощности слишком жарко", 3),
+    "620": ("Защита по температуре охлаждающей жидкости", 7),
+    "652": ("Сильные колебания температуры жидкости", 4),
+    "701": ("Контроллер не поддерживает чип", 10),
+    "702": ("Неизвестная версия контроллера", 10),
+    "710": ("Аварийная перезагрузка контроллера", 10),
+    "712": ("Аварийная перезагрузка контроллера", 3),
+    "714": ("Серьезная нестабильность сети", 10),
+    "720": ("Ошибка связи с хеш-платой", 10),
+    "800": ("Ошибка контрольной суммы cgminer", 10),
+    "801": ("Ошибка контрольной суммы system-monitor", 10),
+    "802": ("Ошибка контрольной суммы remote-daemon", 10),
+    "810": ("Несоответствие режима охлаждения/частоты", 10),
+    "820": ("Несоответствие режима охлаждения/БП", 10),
+    "901": ("Ошибка коэффициента мощности", 5),
+    "9000": ("Процесс завершился аварийно", 0),
+    "2000": ("Не настроены пулы", 10),
+    "2010": ("Все пулы отключены", 10),
+    "2020": ("Не удалось подключиться к пулу", 10),
+    "2030": ("Высокий процент отклоненных шар", 10),
+    "2040": ("Пул не поддерживает ASICBoost", 10),
+    "2050": ("Не удалось переключиться на новый пул", 10),
+    "2310": ("Слишком низкий хешрейт", 10),
+    "2320": ("Слишком низкий хешрейт", 2),
+    "2340": ("Слишком большая потеря хешрейта", 1),
+    "2350": ("Слишком большая потеря хешрейта", 10),
+    "5010": ("Слишком низкое напряжение чипа", 0),
+    "5020": ("Изменилось напряжение чипа", 0),
+    "5030": ("Большой разброс температур чипов", 0),
+    "5040": ("Большой разброс максимальных температур чипов", 2),
+    "5050": ("Защита чипов по температуре", 10),
+    "5070": ("Ненормальная скорость потока жидкости", 10),
+    "5079": ("Слишком медленный поток жидкости", 10),
+    "5080": ("Ошибка калибровки температуры чипа", 0),
+    "5090": ("Ошибка калибровки температуры чипа", 0),
+    "5110": ("Тайм-аут повышения частоты", 10),
+    "6030": ("Защита чипов от перегрева", 10),
+    "8000": ("Устаревшая версия WhatsMinerTool", 0),
+    "8010": ("Частота ниже нормы", 0),
+    "8020": ("Хешрейт ниже нормы", 0),
+    "8400": ("Неверная или неофициальная версия ПО", 0),
+    "8410": ("Прошивка не соответствует модели майнера", 10),
+    "8700": ("Модель майнера не соответствует модели БП", 10),
+    "100000": ("Ошибка библиотеки безопасности", 10),
+    "100001": ("Нарушена подпись системного файла", 10),
+    "100002": ("Нарушен системный файл antiv/dig/initd.dig", 10),
+    "100003": ("Нарушен системный файл antiv/dig/pf_partial.dig", 10),
+    "100100": ("Удален системный btminer", 10),
+    "110000": ("Обнаружен неразрешенный системный файл", 10),
+    "110001": ("Обнаружено удаление файла безопасности", 10),
+}
+ERROR_CODE_PATTERNS = (
+    ("28", ("Ошибка пользовательского регистра БП", 0)),
+    ("30", ("Ошибка датчика температуры хеш-платы", 10)),
+    ("32", ("Ошибка чтения температуры хеш-платы", 10)),
+    ("35", ("Защита по температуре хеш-платы", 10)),
+    ("41", ("Ошибка чтения EEPROM хеш-платы", 10)),
+    ("42", ("Ошибка разбора EEPROM хеш-платы", 10)),
+    ("43", ("Несовпадение типа чипов", 10)),
+    ("44", ("Ошибка количества чипов в EEPROM", 10)),
+    ("45", ("Ошибка передачи данных EEPROM", 10)),
+    ("51", ("Ошибка типа майнера хеш-платы", 10)),
+    ("52", ("Несовпадение типа чипов хеш-платы", 10)),
+    ("53", ("Хеш-плата не обнаружена", 10)),
+    ("54", ("Ошибка чтения ID чипа", 10)),
+    ("55", ("Обнаружены неисправные чипы", 10)),
+    ("56", ("Ошибка балансировки хеш-платы", 10)),
+    ("57", ("Ошибка передачи данных чипа", 10)),
+    ("58", ("Ошибка сброса чипа", 0)),
+    ("59", ("Слишком низкая частота чипов", 5)),
+    ("72", ("Ошибка связи с хеш-платой", 10)),
+    ("90", ("Процесс завершился аварийно", 0)),
+    ("501", ("Слишком низкое напряжение чипа", 0)),
+    ("502", ("Изменилось напряжение чипа", 0)),
+    ("503", ("Большой разброс температур чипов", 0)),
+    ("504", ("Большой разброс максимальных температур чипов", 2)),
+    ("505", ("Защита чипов по температуре", 10)),
+    ("507", ("Ненормальная скорость потока жидкости", 10)),
+    ("508", ("Ошибка калибровки температуры чипа", 0)),
+    ("511", ("Тайм-аут повышения частоты", 10)),
+    ("603", ("Защита чипов от перегрева", 10)),
+)
+ERROR_FIELD_NAMES = {
+    "error", "errors", "errorcode", "errorcodes", "fault", "faults",
+    "faultcode", "faultcodes", "alarm", "alarms", "alarmcode",
+    "alarmcodes", "errcode", "errcodes",
+}
 
 log_handler = TimedRotatingFileHandler(
     'asic_monitor.log',
@@ -219,6 +396,81 @@ class DeviceMonitor:
         else:
             self.selected_devices.clear()
 
+    def _error_info(self, code: str) -> Tuple[str, Optional[int]]:
+        if code in ERROR_CODE_INFO:
+            return ERROR_CODE_INFO[code]
+        for prefix, info in ERROR_CODE_PATTERNS:
+            if code.startswith(prefix):
+                return info
+        return "Неизвестный код ошибки", None
+
+    def _error_codes_in_value(self, value: Any) -> List[str]:
+        codes = []
+        if isinstance(value, dict):
+            for key, nested_value in value.items():
+                normalized_key = str(key).lower().replace("_", "").replace("-", "")
+                if normalized_key in {"code", "id", "errorcode", "errcode"}:
+                    codes.extend(self._error_codes_in_value(nested_value))
+                elif isinstance(nested_value, (dict, list, tuple)):
+                    codes.extend(self._error_codes_in_value(nested_value))
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                codes.extend(self._error_codes_in_value(item))
+        elif isinstance(value, int) and not isinstance(value, bool):
+            if value > 0:
+                codes.append(str(value))
+        elif isinstance(value, str):
+            candidate = value.strip()
+            if candidate.lower().startswith("0x"):
+                try:
+                    codes.append(f"0x{int(candidate, 16):04x}")
+                except ValueError:
+                    pass
+            elif candidate.isdigit() and int(candidate) > 0:
+                codes.append(str(int(candidate)))
+        return codes
+
+    def _extract_device_errors(self, *responses: Dict) -> List[Dict[str, Any]]:
+        found_codes = []
+
+        def visit(value):
+            if isinstance(value, dict):
+                for key, nested_value in value.items():
+                    normalized_key = (
+                        str(key).lower().replace("_", "").replace("-", "")
+                    )
+                    if (
+                        normalized_key in ERROR_FIELD_NAMES
+                        or normalized_key.endswith("error")
+                        or normalized_key.endswith("errors")
+                        or normalized_key.endswith("fault")
+                        or normalized_key.endswith("alarms")
+                    ):
+                        found_codes.extend(
+                            self._error_codes_in_value(nested_value)
+                        )
+                    visit(nested_value)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    visit(item)
+
+        for response in responses:
+            visit(response)
+
+        errors = []
+        for code in dict.fromkeys(found_codes):
+            description, severity = self._error_info(code)
+            errors.append({
+                "code": code,
+                "description": description,
+                "severity": severity,
+                "critical": severity is not None and severity >= 10,
+            })
+        return errors
+
+    def _has_critical_errors(self, device: Dict) -> bool:
+        return any(error.get("critical") for error in device.get("errors", []))
+
     async def _draw_interface(self, stdscr):
         h, w = stdscr.getmaxyx()
         valid_data = self._get_sorted_devices()
@@ -276,19 +528,50 @@ class DeviceMonitor:
         ]
         
         for i, row in enumerate(rows):
-            stdscr.addstr(3 + i, 0, row, curses.color_pair(7))
+            self._safe_addstr(stdscr, 3 + i, 0, row, curses.color_pair(7))
         
-        # Разделительная линия
-        stdscr.addstr(13, 0, "-" * (w-1), curses.color_pair(7))
-        
-        # Информация о пулах
-        stdscr.addstr(14, 0, "Пулы майнинга:", curses.A_BOLD | curses.color_pair(7))
+        error_y = 13
+        self._safe_addstr(stdscr, error_y, 0, "-" * (w - 1), curses.color_pair(7))
+        error_y += 1
+        errors = device.get("errors", [])
+        error_title = f"Ошибки устройства: {len(errors)}"
+        self._safe_addstr(
+            stdscr, error_y, 0, error_title,
+            curses.A_BOLD | (curses.color_pair(9) if self._has_critical_errors(device)
+                             else curses.color_pair(7))
+        )
+        error_y += 1
+        if errors:
+            for error in errors:
+                severity = error.get("severity")
+                level_text = f" | уровень {severity}" if severity is not None else ""
+                error_text = (
+                    f"Код {error['code']}: {error['description']}{level_text}"
+                )
+                error_color = (
+                    curses.color_pair(9) if error.get("critical")
+                    else curses.color_pair(2)
+                )
+                self._safe_addstr(stdscr, error_y, 2, error_text, error_color)
+                error_y += 1
+        else:
+            self._safe_addstr(stdscr, error_y, 2, "Нет активных ошибок")
+            error_y += 1
+
+        pool_y = error_y + 1
+        self._safe_addstr(
+            stdscr, pool_y, 0, "Пулы майнинга:",
+            curses.A_BOLD | curses.color_pair(7)
+        )
         for i, pool in enumerate(device.get('pools', [])[:3]):
             status_color = curses.color_pair(4) if pool.get('status') == 'alive' else curses.color_pair(1)
             pool_text = f"{i+1}. {pool.get('url', 'N/A')}"
-            stdscr.addstr(15 + i*2, 2, pool_text, status_color)
+            self._safe_addstr(stdscr, pool_y + 1 + i * 2, 2, pool_text, status_color)
             worker_text = f"Worker: {pool.get('worker', 'N/A')} | Status: {pool.get('status', 'N/A')}"
-            stdscr.addstr(16 + i*2, 4, worker_text, curses.color_pair(3))
+            self._safe_addstr(
+                stdscr, pool_y + 2 + i * 2, 4, worker_text,
+                curses.color_pair(3)
+            )
         
         # Кнопка возврата
         help_text = "[D]Назад [Q]Выход"
@@ -345,6 +628,8 @@ class DeviceMonitor:
     def _get_device_color(self, device):
         if device['ip'] in self.restarting_devices:
             return curses.color_pair(8)
+        if self._has_critical_errors(device):
+            return curses.color_pair(9)
         if not device.get('online'):
             return curses.color_pair(1)
         if device.get('temp', 0) > OVERHEAT_TEMP:
@@ -354,6 +639,10 @@ class DeviceMonitor:
     def _get_device_status(self, device):
         if device['ip'] in self.restarting_devices:
             return "[RST]"
+        error_count = len(device.get("errors", []))
+        if error_count:
+            marker = "!" if self._has_critical_errors(device) else ""
+            return f"[ERR:{error_count}{marker}]"
         if device.get('temp', 0) > OVERHEAT_TEMP:
             return "[HOT]"
         return "[ON]" if device.get('online') else "[OFF]"
@@ -453,6 +742,7 @@ class DeviceMonitor:
 
             summary = status_data.get('msg', {}).get('summary', {})
             static_msg = static_data.get('msg', {})
+            errors = self._extract_device_errors(status_data, static_data)
             
             return {
                 "ip": ip,
@@ -467,7 +757,8 @@ class DeviceMonitor:
                 "power": summary.get('power-realtime', 0),
                 "target_freq": summary.get('target-freq', 100),
                 "uptime": self.format_uptime(summary.get('elapsed', 0)),
-                "pools": pools
+                "pools": pools,
+                "errors": errors,
             }
         except Exception as e:
             logging.error(f"{ip}: Ошибка получения данных: {str(e)}")

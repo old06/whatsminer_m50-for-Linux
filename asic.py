@@ -518,7 +518,12 @@ class DeviceMonitor:
             await self.operation_queue.put((ip, "update"))
     async def _update_device(self, ip: str):
         writer = None
+        previous_fw_version = None
         try:
+            device_before = await self.get_device_data(ip)
+            if device_before.get("online"):
+                previous_fw_version = device_before.get("fw_version")
+
             salt = await self.get_salt(ip)
             ts = int(time.time())
             payload = {
@@ -562,9 +567,26 @@ class DeviceMonitor:
                 progress = sent / firmware_size
                 self.operation_progress[ip] = ("update", time.time(), UPDATE_DURATION, f"upload {progress:.1%}")
 
-            logging.info(f"{ip}: Прошивка успешно передана")
+            writer.close()
+            await writer.wait_closed()
+            writer = None
+            logging.info(f"{ip}: Передача файла прошивки завершена; ожидается установка")
             self.operation_progress[ip] = ("update", time.time(), UPDATE_DURATION, "finalizing")
             await asyncio.sleep(UPDATE_DURATION)
+
+            device_after = await self.get_device_data(ip)
+            if not device_after.get("online"):
+                logging.warning(f"{ip}: Устройство недоступно после передачи; обновление не подтверждено")
+            elif previous_fw_version and device_after.get("fw_version") != previous_fw_version:
+                logging.info(
+                    f"{ip}: Прошивка обновлена: {previous_fw_version} -> {device_after.get('fw_version')}"
+                )
+            elif previous_fw_version:
+                logging.warning(
+                    f"{ip}: Версия прошивки не изменилась ({previous_fw_version}); обновление не подтверждено"
+                )
+            else:
+                logging.warning(f"{ip}: Не удалось проверить версию прошивки после передачи")
         
         except Exception as e:
             logging.error(f"{ip}: Ошибка обновления: {str(e)}", exc_info=True)

@@ -567,10 +567,24 @@ class DeviceMonitor:
                 progress = sent / firmware_size
                 self.operation_progress[ip] = ("update", time.time(), UPDATE_DURATION, f"upload {progress:.1%}")
 
+            length = int.from_bytes(
+                await asyncio.wait_for(reader.readexactly(4), READ_TIMEOUT), 'little'
+            )
+            if length <= 0 or length > 1024 * 1024:
+                raise CommandError(f"Invalid firmware completion response length: {length}")
+            completion_resp = json.loads(
+                (await asyncio.wait_for(reader.readexactly(length), READ_TIMEOUT)).decode('ascii')
+            )
+            if completion_resp.get('code') != 0:
+                raise CommandError(
+                    "Устройство отклонило прошивку: "
+                    f"code={completion_resp.get('code')}, msg={completion_resp.get('msg')}"
+                )
+
+            logging.info(f"{ip}: Устройство подтвердило прошивку; ожидается перезагрузка")
             writer.close()
             await writer.wait_closed()
             writer = None
-            logging.info(f"{ip}: Передача файла прошивки завершена; ожидается установка")
             self.operation_progress[ip] = ("update", time.time(), UPDATE_DURATION, "finalizing")
             await asyncio.sleep(UPDATE_DURATION)
 

@@ -553,6 +553,10 @@ class DeviceMonitor:
             with open(self.firmware_path, 'rb') as f:
                 firmware_data = f.read()
             firmware_size = len(firmware_data)
+            firmware_sha256 = hashlib.sha256(firmware_data).hexdigest()
+            logging.info(
+                f"{ip}: Образ для передачи: {firmware_size} байт, SHA-256 {firmware_sha256}"
+            )
 
             writer.write(firmware_size.to_bytes(4, 'little'))
             await writer.drain()
@@ -581,7 +585,7 @@ class DeviceMonitor:
                     f"code={completion_resp.get('code')}, msg={completion_resp.get('msg')}"
                 )
 
-            logging.info(f"{ip}: Устройство подтвердило прошивку; ожидается перезагрузка")
+            logging.info(f"{ip}: API завершил прием файла; ожидаются проверка пакета и перезагрузка")
             writer.close()
             await writer.wait_closed()
             writer = None

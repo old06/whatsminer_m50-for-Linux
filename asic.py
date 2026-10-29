@@ -571,18 +571,40 @@ class DeviceMonitor:
                 progress = sent / firmware_size
                 self.operation_progress[ip] = ("update", time.time(), UPDATE_DURATION, f"upload {progress:.1%}")
 
-            length = int.from_bytes(
-                await asyncio.wait_for(reader.readexactly(4), READ_TIMEOUT), 'little'
-            )
-            if length <= 0 or length > 1024 * 1024:
-                raise CommandError(f"Invalid firmware completion response length: {length}")
-            completion_resp = json.loads(
-                (await asyncio.wait_for(reader.readexactly(length), READ_TIMEOUT)).decode('ascii')
-            )
-            if completion_resp.get('code') != 0:
+            response_prefix = await asyncio.wait_for(reader.readexactly(2), READ_TIMEOUT)
+            if response_prefix.lower() == b"ok":
+                completion_resp = {"code": 0, "msg": "ok"}
+            else:
+                length_bytes = response_prefix + await asyncio.wait_for(
+                    reader.readexactly(2), READ_TIMEOUT
+                )
+                length = int.from_bytes(length_bytes, 'little')
+                if length <= 0 or length > 1024 * 1024:
+                    raise CommandError(
+                        f"Invalid firmware completion response length: {length}"
+                    )
+                response_data = await asyncio.wait_for(
+                    reader.readexactly(length), READ_TIMEOUT
+                )
+                try:
+                    completion_resp = json.loads(response_data.decode('ascii'))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    if response_data.strip().lower() in {b"ok", b"success"}:
+                        completion_resp = {"code": 0, "msg": "ok"}
+                    else:
+                        raise CommandError("Invalid firmware completion response")
+
+            completion_code = completion_resp.get('code', completion_resp.get('Code'))
+            completion_msg = completion_resp.get('msg', completion_resp.get('Msg'))
+            successful_codes = (0, "0", 131, "131")
+            successful_messages = {"ok", "success"}
+            if (
+                completion_code not in successful_codes
+                and str(completion_msg).strip().lower() not in successful_messages
+            ):
                 raise CommandError(
                     "Устройство отклонило прошивку: "
-                    f"code={completion_resp.get('code')}, msg={completion_resp.get('msg')}"
+                    f"code={completion_code}, msg={completion_msg}"
                 )
 
             logging.info(f"{ip}: API завершил прием файла; ожидаются проверка пакета и перезагрузка")

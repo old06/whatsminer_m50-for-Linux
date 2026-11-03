@@ -576,10 +576,16 @@ class DeviceMonitor:
         avg_temp = sum(d.get('temp', 0) for d in online_devices) / len(online_devices) if online_devices else 0
         online_count = len(online_devices)
         offline_count = len(valid_data) - online_count - len(self.restarting_devices)
+        error_count = sum(len(device.get("errors", [])) for device in valid_data)
+        error_device_count = sum(bool(device.get("errors")) for device in valid_data)
 
         stdscr.erase()
         
-        header = f"ASIC Monitor v1.2 | Устройств: {len(valid_data)} (ON: {online_count} OFF: {offline_count} RST: {len(self.restarting_devices)})"
+        header = (
+            f"Ошибки: {error_count} ({error_device_count} устройств) | "
+            f"Всего: {len(valid_data)} | ON: {online_count} | "
+            f"OFF: {offline_count} | RST: {len(self.restarting_devices)}"
+        )
         stats = f"Хэшрейт: {total_hashrate:.1f} TH/s | Питание: {total_power/1000:.1f} kW | Темп: {avg_temp:.1f}°C"
         self._safe_addstr(stdscr, 0, 0, header, curses.A_BOLD | curses.color_pair(7))
         self._safe_addstr(stdscr, 1, 0, stats, curses.color_pair(7))
@@ -686,8 +692,14 @@ class DeviceMonitor:
             pass
 
     def _draw_devices_list(self, stdscr, h, w, devices):
-        max_visible_rows = h - 8
+        max_visible_rows = max(0, h - 8)
         start_row = 3
+        columns = self._device_table_columns(w)
+        header = " | ".join(
+            label[:column_width].center(column_width)
+            for label, column_width, _, _ in columns
+        )
+        self._safe_addstr(stdscr, start_row - 1, 0, header, curses.A_BOLD)
         
         for i in range(max_visible_rows):
             idx = i + self.scroll_offset
@@ -704,17 +716,55 @@ class DeviceMonitor:
             if idx == self.current_row:
                 color |= curses.A_BOLD | curses.color_pair(6)
             
-            line = self._format_device_line(device, status, w)
-            stdscr.addstr(y, 0, line, color)
+            line = self._format_device_line(device, w, columns)
+            self._safe_addstr(stdscr, y, 0, line, color)
 
-    def _format_device_line(self, device, status, width):
-        fan_info = f"Fan: {device.get('fan_in', 0)}/{device.get('fan_out', 0)} RPM" if device.get('online') else ""
-        freq_info = f"Freq: {device.get('target_freq', 0)}%" if device.get('online') else ""
-        line = (f"{status} {device['ip']:15} | Temp: {device.get('temp', 0):.1f}°C | "
-                f"Hash: {device.get('hashrate', 0):.1f} TH/s | Power: {device.get('power', 0)/1000:.1f} kW | "
-                f"Up: {device.get('uptime', 'N/A')} | Ver: {device.get('fw_version', 'N/A')[:8]} | "
-                f"{freq_info} {fan_info}")
-        return line[:max(0, width-1)].ljust(width-1)
+    def _device_table_columns(self, width):
+        columns = [
+            ("STATUS", 8, lambda device: self._get_device_status(device), "<"),
+            ("IP", 15, lambda device: device.get("ip", "N/A"), "<"),
+            ("ERR", 5, lambda device: len(device.get("errors", [])), ">"),
+            ("TEMP C", 8, lambda device: f"{device.get('temp', 0):.1f}", ">"),
+            ("HASH TH/s", 10, lambda device: f"{device.get('hashrate', 0):.1f}", ">"),
+            ("POWER kW", 9, lambda device: f"{device.get('power', 0) / 1000:.1f}", ">"),
+            ("UPTIME", 12, lambda device: device.get("uptime", "N/A"), "<"),
+            ("FW", 8, lambda device: device.get("fw_version", "N/A"), "<"),
+            ("FREQ %", 7, lambda device: device.get("target_freq", 0), ">"),
+            (
+                "FANS RPM", 13,
+                lambda device: (
+                    f"{device.get('fan_in', 0)}/{device.get('fan_out', 0)}"
+                ),
+                ">",
+            ),
+        ]
+        available_width = max(0, width - 1)
+        while len(columns) > 6:
+            required_width = sum(column[1] for column in columns) + 3 * (len(columns) - 1)
+            if required_width <= available_width:
+                break
+            columns.pop()
+
+        required_width = sum(column[1] for column in columns) + 3 * (len(columns) - 1)
+        if required_width > available_width and len(columns) > 4:
+            columns.pop(5)
+            columns.pop(4)
+
+        required_width = sum(column[1] for column in columns) + 3 * (len(columns) - 1)
+        if required_width > available_width and len(columns) > 2:
+            ip_width = max(7, columns[1][1] - (required_width - available_width))
+            label, _, value, align = columns[1]
+            columns[1] = (label, ip_width, value, align)
+        return columns
+
+    def _format_device_line(self, device, width, columns=None):
+        columns = columns or self._device_table_columns(width)
+        cells = []
+        for _, column_width, value_getter, alignment in columns:
+            value = str(value_getter(device))[:column_width]
+            cells.append(value.rjust(column_width) if alignment == ">"
+                         else value.ljust(column_width))
+        return " | ".join(cells)
 
     def _get_device_color(self, device):
         if device['ip'] in self.restarting_devices:
@@ -729,14 +779,15 @@ class DeviceMonitor:
 
     def _get_device_status(self, device):
         if device['ip'] in self.restarting_devices:
-            return "[RST]"
+            return "RST"
+        if self._has_critical_errors(device):
+            return "CRITICAL"
         error_count = len(device.get("errors", []))
         if error_count:
-            marker = "!" if self._has_critical_errors(device) else ""
-            return f"[ERR:{error_count}{marker}]"
+            return "ERROR"
         if device.get('temp', 0) > OVERHEAT_TEMP:
-            return "[HOT]"
-        return "[ON]" if device.get('online') else "[OFF]"
+            return "HOT"
+        return "ONLINE" if device.get('online') else "OFFLINE"
 
     def _draw_progress_bars(self, stdscr, h, w):
         progress_y = h - 4

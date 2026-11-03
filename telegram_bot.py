@@ -16,11 +16,18 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from asic import DeviceMonitor, DeviceError, ValidationError, OVERHEAT_TEMP
+from asic import (
+    DeviceMonitor,
+    DeviceError,
+    ValidationError,
+    OVERHEAT_TEMP,
+    configure_logging,
+)
 
 
 T = TypeVar("T")
 CommandCallback = Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[T]]
+MAX_STATUS_MESSAGE_LENGTH = 4000
 
 
 def _allowed_user_ids() -> Set[int]:
@@ -43,8 +50,7 @@ def authorized(
         context: ContextTypes.DEFAULT_TYPE,
     ) -> T:
         user = update.effective_user
-        allowed_ids = context.application.bot_data["allowed_user_ids"]
-        if user is None or user.id not in allowed_ids:
+        if user is None or user.id not in self.allowed_user_ids:
             if update.effective_message:
                 await update.effective_message.reply_text("Access denied.")
             logging.warning(
@@ -78,6 +84,11 @@ def _status_summary(devices: List[dict]) -> str:
     )
     online_count = len(online)
     offline_count = len(devices) - online_count
+    error_count = sum(len(device.get("errors", [])) for device in devices)
+    critical_count = sum(
+        any(error.get("critical") for error in device.get("errors", []))
+        for device in devices
+    )
 
     return (
         "<b>Device Status</b>\n"
@@ -85,22 +96,44 @@ def _status_summary(devices: List[dict]) -> str:
         f"Hashrate: <b>{total_hashrate:.1f}</b> TH/s | "
         f"Power: <b>{total_power / 1000:.1f}</b> kW | "
         f"Average temp: <b>{avg_temp:.1f}</b>°C\n"
+        f"Errors: <b>{error_count}</b> | "
+        f"Critical devices: <b>{critical_count}</b>\n"
     )
 
 
 def _device_line(device: dict, index: int) -> str:
-    status = "ON" if device.get("online") else "OFF"
+    errors = device.get("errors", [])
+    critical = any(error.get("critical") for error in errors)
+    status = "CRITICAL" if critical else "ERROR" if errors else (
+        "ON" if device.get("online") else "OFF"
+    )
     temp = device.get("temp", 0)
     hashrate = device.get("hashrate", 0)
     power = device.get("power", 0) / 1000
     warning = " ❗" if temp > OVERHEAT_TEMP else ""
+    error_summary = f" | Errors: {len(errors)}" if errors else ""
     return (
         f"{index}. <code>{html.escape(device['ip'])}</code> — "
         f"<b>{status}</b> | "
         f"{hashrate:.1f} TH/s | "
         f"{temp:.1f}°C | "
-        f"{power:.1f} kW{warning}"
+        f"{power:.1f} kW{error_summary}{warning}"
     )
+
+
+def _chunk_status_message(prefix: str, lines: List[str]) -> List[str]:
+    chunks = []
+    current = prefix
+    for line in lines:
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > MAX_STATUS_MESSAGE_LENGTH and current:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def _help_text() -> str:
@@ -112,6 +145,7 @@ def _help_text() -> str:
         "/frequency &lt;-100..100&gt; [IP ...] — set frequency\n"
         "/power &lt;0..99999&gt; [IP ...] — set power limit\n"
         "/fan &lt;normal|zero&gt; [IP ...] — set fan mode\n"
+        "/mode &lt;normal|low|high&gt; [IP ...] — set power mode\n"
         "/help — this help\n\n"
         "Without IP list, command applies to all devices."
     )
@@ -121,6 +155,7 @@ class TelegramBot:
     def __init__(self, monitor: DeviceMonitor, allowed_user_ids: Set[int]):
         self.monitor = monitor
         self.allowed_user_ids = allowed_user_ids
+        self.operation_lock = asyncio.Lock()
 
     async def whoami(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -141,7 +176,14 @@ class TelegramBot:
         try:
             devices = _selected_devices(self.monitor, context.args)
             results = await self._get_devices(devices)
-            results = sorted(results, key=lambda d: d.get("hashrate", 0), reverse=True)
+            results = sorted(
+                results,
+                key=lambda device: (
+                    device.get("online", False),
+                    device.get("hashrate", 0),
+                ),
+                reverse=True,
+            )
             if not results:
                 await update.effective_message.reply_text("No data.")
                 return
@@ -153,27 +195,35 @@ class TelegramBot:
                 message += (
                     f"<b>WARNING:</b> temperature exceeded on devices: {names}.\n"
                 )
-            message += "\n".join(
+            device_lines = [
                 _device_line(device, idx + 1)
                 for idx, device in enumerate(results)
-            )
-            await update.effective_message.reply_text(
-                message,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
+            ]
+            for chunk in _chunk_status_message(message, device_lines):
+                await update.effective_message.reply_text(
+                    chunk,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
         except ValueError as exc:
             await update.effective_message.reply_text(str(exc))
 
     @authorized
     async def reboot(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
-            self.monitor.selected_devices = _selected_devices(self.monitor, context.args)
-            await self.monitor._init_async_resources()
-            await self.monitor.reboot_devices()
-            await update.effective_message.reply_text(
-                f"Reboot queued for {len(self.monitor.selected_devices)} device(s)."
+            async with self.operation_lock:
+                self.monitor.selected_devices = _selected_devices(
+                    self.monitor, context.args
+                )
+                await self.monitor._init_async_resources()
+                device_count = await self.monitor.reboot_devices()
+            message = (
+                f"Reboot queued for {device_count} device(s)."
+                if device_count
+                else "No reboot queued; selected devices "
+                "already have pending operations."
             )
+            await update.effective_message.reply_text(message)
         except ValueError as exc:
             await update.effective_message.reply_text(str(exc))
 
@@ -194,8 +244,15 @@ class TelegramBot:
         try:
             if not context.args or context.args[0] not in {"normal", "low", "high"}:
                 raise ValueError("Usage: /mode normal|low|high [IP ...]")
-            self.monitor.selected_devices = _selected_devices(self.monitor, context.args[1:])
-            await self.monitor.set_power_mode(context.args[0])
+            async with self.operation_lock:
+                self.monitor.selected_devices = _selected_devices(
+                    self.monitor, context.args[1:]
+                )
+                succeeded = await self.monitor.set_power_mode(context.args[0])
+            if not succeeded:
+                raise DeviceError(
+                    "Not all devices accepted the power mode command."
+                )
             await update.effective_message.reply_text(
                 f"Performance mode set to {context.args[0]}."
             )
@@ -221,12 +278,18 @@ class TelegramBot:
             message, parse_mode="HTML", disable_web_page_preview=True
         )
 
+    @authorized
     async def fan(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             if not context.args or context.args[0] not in {"normal", "zero"}:
                 raise ValueError("Usage: /fan normal|zero [IP ...]")
-            self.monitor.selected_devices = _selected_devices(self.monitor, context.args[1:])
-            await self.monitor.set_fan_mode(context.args[0])
+            async with self.operation_lock:
+                self.monitor.selected_devices = _selected_devices(
+                    self.monitor, context.args[1:]
+                )
+                succeeded = await self.monitor.set_fan_mode(context.args[0])
+            if not succeeded:
+                raise DeviceError("Not all devices accepted the fan command.")
             await update.effective_message.reply_text("Fan mode changed.")
         except (ValueError, DeviceError) as exc:
             await update.effective_message.reply_text(f"Error: {exc}")
@@ -243,8 +306,15 @@ class TelegramBot:
             if not context.args:
                 raise ValueError(f"Usage: /{command} <value> [IP ...]")
             value = int(context.args[0])
-            self.monitor.selected_devices = _selected_devices(self.monitor, context.args[1:])
-            await operation(value)
+            async with self.operation_lock:
+                self.monitor.selected_devices = _selected_devices(
+                    self.monitor, context.args[1:]
+                )
+                succeeded = await operation(value)
+            if not succeeded:
+                raise DeviceError(
+                    f"Not all devices accepted the {name} command."
+                )
             await update.effective_message.reply_text(f"{name.capitalize()} set.")
         except (ValueError, ValidationError, DeviceError) as exc:
             await update.effective_message.reply_text(f"Error: {exc}")
@@ -263,11 +333,11 @@ def build_application(monitor: DeviceMonitor) -> Application:
     allowed_ids = _allowed_user_ids()
     if not allowed_ids:
         raise ValueError("TELEGRAM_ALLOWED_USER_IDS is not set")
+    configure_logging()
 
     bot = TelegramBot(monitor, allowed_ids)
 
     async def initialize(application: Application) -> None:
-        application.bot_data["allowed_user_ids"] = allowed_ids
         await monitor._init_async_resources()
         bot_info = await application.bot.get_me()
         print(

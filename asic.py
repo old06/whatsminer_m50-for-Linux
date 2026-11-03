@@ -8,17 +8,19 @@ import time
 import os
 import logging
 import asyncio
+import ipaddress
 from logging.handlers import TimedRotatingFileHandler
-from collections import defaultdict
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from dotenv import load_dotenv
 import argparse
 from typing import Dict, List, Set, Tuple, Optional, Any
 
-load_dotenv()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-CONFIG_FILE = "asic_devices.json"
+CONFIG_FILE = os.path.join(BASE_DIR, "asic_devices.json")
+LOG_FILE = os.path.join(BASE_DIR, "asic_monitor.log")
 API_PORT = 4433
 ACCOUNTS = {
     "super": os.getenv("SUPER_PASSWORD", ""),
@@ -31,11 +33,12 @@ STATS_UPDATE_INTERVAL = 1
 REBOOT_DURATION = 60
 UPDATE_DURATION = 300
 MAX_CONCURRENT_OPS = 10
+MAX_SCAN_ADDRESSES = 65536
 COMMAND_RETRIES = 3
 CONNECTION_TIMEOUT = 15
 READ_TIMEOUT = 50
 CHUNK_SIZE = 4096
-DEFAULT_FIRMWARE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "firmware.bin")
+DEFAULT_FIRMWARE = os.path.join(BASE_DIR, "firmware.bin")
 ENCRYPTED_COMMANDS = {'set.miner.pools', 'set.user.change_passwd', 'set.miner.power_percent'}
 OVERHEAT_TEMP = 80  # Температура перегрева
 ERROR_CODE_INFO = {
@@ -210,23 +213,47 @@ ERROR_CODE_PATTERNS = (
     ("511", ("Тайм-аут повышения частоты", 10)),
     ("603", ("Защита чипов от перегрева", 10)),
 )
+PSU_ERROR_INFO = {
+    "0x0001": ("Низкое входное напряжение БП", False),
+    "0x0002": ("Защита радиатора БП от перегрева", True),
+    "0x0004": ("Защита радиатора БП от перегрева", True),
+    "0x0008": ("Защита БП от высокой температуры окружающей среды", True),
+    "0x0010": ("Защита первичной цепи БП от сверхтока", True),
+    "0x0020": ("Пониженное выходное напряжение БП", True),
+    "0x0040": ("Защита выхода БП от сверхтока", True),
+    "0x0080": ("Защита первичной цепи БП от сверхтока", True),
+    "0x0100": ("Сверхток в одной из цепей БП", True),
+    "0x0200": ("Сверхток в одной из цепей БП", True),
+    "0x0400": ("Сверхток в одной из цепей БП", True),
+    "0x0800": ("Отказ вентилятора БП", True),
+    "0x1000": ("Длительная защита выхода БП от сверхтока", True),
+    "0x2000": ("Длительная защита выхода БП от сверхтока", True),
+}
 ERROR_FIELD_NAMES = {
     "error", "errors", "errorcode", "errorcodes", "fault", "faults",
     "faultcode", "faultcodes", "alarm", "alarms", "alarmcode",
     "alarmcodes", "errcode", "errcodes",
 }
 
-log_handler = TimedRotatingFileHandler(
-    'asic_monitor.log',
-    when='midnight',
-    interval=1,
-    backupCount=7
-)
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[log_handler]
-)
+def configure_logging():
+    logger = logging.getLogger()
+    if not any(
+        isinstance(handler, TimedRotatingFileHandler)
+        and handler.baseFilename == LOG_FILE
+        for handler in logger.handlers
+    ):
+        handler = TimedRotatingFileHandler(
+            LOG_FILE,
+            when="midnight",
+            interval=1,
+            backupCount=7,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s - %(levelname)s - %(message)s"
+        ))
+        logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 class DeviceError(Exception):
     """Базовое исключение для ошибок устройства"""
@@ -255,31 +282,17 @@ class DeviceMonitor:
         self.monitor_paused = False
         self.selected_devices: Set[str] = set()
         self.active_tasks: Set[asyncio.Task] = set()
-        self.device_states: Dict[str, Dict] = defaultdict(dict)
-        self.device_errors: Dict[str, List] = defaultdict(list)
         self.salt_cache: Dict[str, str] = {}
         self.stats_cache = {"all_devices": []}
         self.operation_queue = None
+        self.pending_operation_devices: Set[str] = set()
         self.operation_progress: Dict[str, Tuple] = {}
         self.firmware_path = DEFAULT_FIRMWARE
         self.lock = None
+        self.api_semaphore = asyncio.Semaphore(MAX_CONCURRENT_OPS)
         self.restarting_devices: Set[str] = set()
         self.detailed_view = False  # Режим детального просмотра устройства
         
-        self.ERROR_CODES = {
-            0: "Успех",
-            -1: "Общая ошибка",
-            -2: "Неверная команда",
-            -3: "Неверный JSON",
-            -4: "Нет прав",
-            -5: "Недостаточно памяти",
-            -6: "Ошибка прошивки",
-            -7: "Неверная сигнатура",
-            -8: "Недостаточно места",
-            -9: "Ошибка проверки",
-            -999: "Сетевая ошибка"
-        }
-
     async def _init_async_resources(self):
         if self.operation_queue is None:
             self.operation_queue = asyncio.Queue()
@@ -287,10 +300,16 @@ class DeviceMonitor:
             self.lock = asyncio.Lock()
         if not self.active_tasks:
             self.active_tasks.update({
-                asyncio.create_task(self._process_operations()),
                 asyncio.create_task(self._update_progress_bars()),
                 asyncio.create_task(self._update_stats())
             })
+            self.active_tasks.update(
+                asyncio.create_task(
+                    self._process_operations(),
+                    name=f"operation-worker-{index}",
+                )
+                for index in range(MAX_CONCURRENT_OPS)
+            )
 
     async def monitor(self, stdscr):
         curses.curs_set(0)
@@ -334,7 +353,7 @@ class DeviceMonitor:
             elif key in [KEY_UP, 259, 65]:
                 self._handle_key_up()
             elif key in [KEY_DOWN, 258, 66]:
-                self._handle_key_down()
+                self._handle_key_down(stdscr)
             elif key == ord(' '):
                 self._toggle_device_selection()
             elif key == ord('a'):
@@ -342,7 +361,12 @@ class DeviceMonitor:
             elif key == ord('r'):
                 await self.reboot_devices()
             elif key == ord('u'):
-                await self.update_firmware()
+                if await self._confirm_action(
+                    stdscr,
+                    "Upload firmware to "
+                    f"{len(self.selected_devices)} device(s)? [y/N]",
+                ):
+                    await self.update_firmware()
             elif key == ord('p'):
                 self.monitor_paused = not self.monitor_paused
             elif key == ord('f'):
@@ -358,10 +382,28 @@ class DeviceMonitor:
             elif key == ord('d'):
                 self.detailed_view = not self.detailed_view  # Переключение детального просмотра
             elif key == ord('F'):
-                await self.factory_reset()
+                if await self._confirm_action(
+                    stdscr,
+                    "Factory reset "
+                    f"{len(self.selected_devices)} device(s)? [y/N]",
+                ):
+                    await self.factory_reset()
             elif key == ord('C'):
                 await self._set_frequency_dialog(stdscr)
             key = stdscr.getch()
+
+    async def _confirm_action(self, stdscr, prompt: str) -> bool:
+        h, _ = stdscr.getmaxyx()
+        self._safe_addstr(stdscr, max(0, h - 2), 0, prompt, curses.A_REVERSE)
+        stdscr.refresh()
+        while self.monitor_running:
+            key = stdscr.getch()
+            if key in (ord('y'), ord('Y')):
+                return True
+            if key in (ord('n'), ord('N'), 27):
+                return False
+            await asyncio.sleep(MONITOR_INTERVAL)
+        return False
 
     def _handle_key_up(self):
         if self.current_row > 0:
@@ -369,11 +411,11 @@ class DeviceMonitor:
             if self.current_row < self.scroll_offset:
                 self.scroll_offset = self.current_row
 
-    def _handle_key_down(self):
+    def _handle_key_down(self, stdscr):
         valid_data = self._get_sorted_devices()
         total_items = len(valid_data)
-        h, _ = curses.getsyx()
-        max_visible_rows = h - 8
+        h, _ = stdscr.getmaxyx()
+        max_visible_rows = max(1, h - 8)
         
         if self.current_row < total_items - 1:
             self.current_row += 1
@@ -397,12 +439,30 @@ class DeviceMonitor:
             self.selected_devices.clear()
 
     def _error_info(self, code: str) -> Tuple[str, Optional[int]]:
+        if code in PSU_ERROR_INFO:
+            return PSU_ERROR_INFO[code][0], None
         if code in ERROR_CODE_INFO:
             return ERROR_CODE_INFO[code]
         for prefix, info in ERROR_CODE_PATTERNS:
             if code.startswith(prefix):
                 return info
         return "Неизвестный код ошибки", None
+
+    def _normalize_error_code(self, value: Any) -> Optional[str]:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return str(value) if value > 0 else None
+        if not isinstance(value, str):
+            return None
+
+        candidate = value.strip()
+        if candidate.lower().startswith("0x"):
+            try:
+                return f"0x{int(candidate, 16):04x}"
+            except ValueError:
+                return None
+        if candidate.isdigit() and int(candidate) > 0:
+            return str(int(candidate))
+        return None
 
     def _error_codes_in_value(self, value: Any) -> List[str]:
         codes = []
@@ -411,26 +471,41 @@ class DeviceMonitor:
                 normalized_key = str(key).lower().replace("_", "").replace("-", "")
                 if normalized_key in {"code", "id", "errorcode", "errcode"}:
                     codes.extend(self._error_codes_in_value(nested_value))
+                elif self._normalize_error_code(str(key)):
+                    codes.append(self._normalize_error_code(str(key)))
                 elif isinstance(nested_value, (dict, list, tuple)):
                     codes.extend(self._error_codes_in_value(nested_value))
         elif isinstance(value, (list, tuple)):
             for item in value:
                 codes.extend(self._error_codes_in_value(item))
-        elif isinstance(value, int) and not isinstance(value, bool):
-            if value > 0:
-                codes.append(str(value))
-        elif isinstance(value, str):
-            candidate = value.strip()
-            if candidate.lower().startswith("0x"):
-                try:
-                    codes.append(f"0x{int(candidate, 16):04x}")
-                except ValueError:
-                    pass
-            elif candidate.isdigit() and int(candidate) > 0:
-                codes.append(str(int(candidate)))
+        else:
+            code = self._normalize_error_code(value)
+            if code:
+                codes.append(code)
         return codes
 
+    def _error_reasons_in_value(self, value: Any) -> Dict[str, str]:
+        reasons = {}
+        if isinstance(value, dict):
+            reason = next((
+                str(item).strip()
+                for key, item in value.items()
+                if str(key).lower() in {"reason", "message", "description"}
+                and item
+            ), "")
+            for key, nested_value in value.items():
+                code = self._normalize_error_code(str(key))
+                if code and reason:
+                    reasons[code] = reason
+                elif isinstance(nested_value, (dict, list, tuple)):
+                    reasons.update(self._error_reasons_in_value(nested_value))
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                reasons.update(self._error_reasons_in_value(item))
+        return reasons
+
     def _extract_device_errors(self, *responses: Dict) -> List[Dict[str, Any]]:
+        found_reasons = {}
         found_codes = []
 
         def visit(value):
@@ -449,6 +524,9 @@ class DeviceMonitor:
                         found_codes.extend(
                             self._error_codes_in_value(nested_value)
                         )
+                        found_reasons.update(
+                            self._error_reasons_in_value(nested_value)
+                        )
                     visit(nested_value)
             elif isinstance(value, (list, tuple)):
                 for item in value:
@@ -460,11 +538,15 @@ class DeviceMonitor:
         errors = []
         for code in dict.fromkeys(found_codes):
             description, severity = self._error_info(code)
+            description = found_reasons.get(code, description)
+            critical = (
+                severity is not None and severity >= 10
+            ) or PSU_ERROR_INFO.get(code, ("", False))[1]
             errors.append({
                 "code": code,
                 "description": description,
                 "severity": severity,
-                "critical": severity is not None and severity >= 10,
+                "critical": critical,
             })
         return errors
 
@@ -474,6 +556,15 @@ class DeviceMonitor:
     async def _draw_interface(self, stdscr):
         h, w = stdscr.getmaxyx()
         valid_data = self._get_sorted_devices()
+        if valid_data:
+            self.current_row = min(self.current_row, len(valid_data) - 1)
+            self.scroll_offset = min(
+                self.scroll_offset,
+                max(0, len(valid_data) - max(1, h - 8)),
+            )
+        else:
+            self.current_row = 0
+            self.scroll_offset = 0
         
         if self.detailed_view and valid_data and self.current_row < len(valid_data):
             await self._draw_device_details(stdscr, valid_data[self.current_row], h, w)
@@ -497,8 +588,8 @@ class DeviceMonitor:
         self._draw_progress_bars(stdscr, h, w)
         
         help_text = (
-            "[Space]Выбор [A]Все [R]Рестарт [U]Обновить [F]Вент [L]LED [M]Питание [L]Лимит [P]Пулы [D]Детали "
-            "[C]Частота [F]Сброс [Q]Выход"
+            "[Space]Выбор [a]Все [r]Рестарт [u]Прошивка [f]Вент [l]LED "
+            "[m]Режим [L]Лимит [P]Пулы [d]Детали [C]Частота [F]Сброс [q]Выход"
         )
         self._safe_addstr(stdscr, h-1, 0, help_text.ljust(w-1), curses.A_REVERSE)
         stdscr.refresh()
@@ -581,7 +672,7 @@ class DeviceMonitor:
     def _get_sorted_devices(self):
         return sorted(
             [d for d in self.stats_cache["all_devices"] if isinstance(d, dict)],
-            key=lambda x: (not x.get('online'), x.get('hashrate', 0)),
+            key=lambda x: (x.get('online', False), x.get('hashrate', 0)),
             reverse=True
         )
 
@@ -650,8 +741,14 @@ class DeviceMonitor:
     def _draw_progress_bars(self, stdscr, h, w):
         progress_y = h - 4
         for ip, (op_type, start, duration, stage) in self.operation_progress.items():
-            elapsed = time.time() - start
-            progress = min(elapsed / duration, 1.0) if duration > 0 else 0
+            if isinstance(stage, str) and stage.startswith("upload "):
+                try:
+                    progress = float(stage[7:].rstrip("%")) / 100
+                except ValueError:
+                    progress = 0
+            else:
+                elapsed = time.time() - start
+                progress = min(elapsed / duration, 1.0) if duration > 0 else 0
             bar_width = int(w * 0.6)
             filled = int(bar_width * progress)
             bar = '█' * filled + '-' * (bar_width - filled)
@@ -661,17 +758,16 @@ class DeviceMonitor:
                 break
 
     async def _process_operations(self):
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_OPS)
         while self.monitor_running:
-            async with semaphore:
-                ip, operation = await self.operation_queue.get()
-                try:
-                    if operation == "reboot":
-                        await self._reboot_device(ip)
-                    elif operation == "update":
-                        await self._update_device(ip)
-                finally:
-                    self.operation_queue.task_done()
+            ip, operation = await self.operation_queue.get()
+            try:
+                if operation == "reboot":
+                    await self._reboot_device(ip)
+                elif operation == "update":
+                    await self._update_device(ip)
+            finally:
+                self.operation_queue.task_done()
+                self.pending_operation_devices.discard(ip)
 
     async def _update_progress_bars(self):
         while self.monitor_running:
@@ -724,11 +820,21 @@ class DeviceMonitor:
             if static_data.get('code') != 0:
                 return {"ip": ip, "online": False}
             
-            status_data = await self.send_command(ip, {"cmd": "get.miner.status", "param": "summary"})
-            pools_data = await self.send_command(ip, {"cmd": "get.miner.status", "param": "pools"})
+            status_data = await self.send_command(ip, {
+                "cmd": "get.miner.status",
+                "param": "summary+pools",
+            })
+            static_msg = static_data.get('msg', {})
+            errors = self._extract_device_errors(static_data)
+            status_msg = status_data.get('msg', {})
+            if not isinstance(static_msg, dict):
+                static_msg = {}
+            if not isinstance(status_msg, dict):
+                status_msg = {}
+
             pools = []
-            if pools_data.get('code') == 0:
-                raw_pools = pools_data.get('msg', {}).get('pools', [])
+            if status_data.get('code') == 0:
+                raw_pools = status_msg.get('pools', [])
                 for p in raw_pools:
                     pools.append({
                         "url": p.get('pool', p.get('url', 'N/A')),
@@ -738,11 +844,11 @@ class DeviceMonitor:
                     })
     
             if status_data.get('code') != 0:
-                return {"ip": ip, "online": False}
+                return {"ip": ip, "online": False, "errors": errors}
 
-            summary = status_data.get('msg', {}).get('summary', {})
-            static_msg = static_data.get('msg', {})
-            errors = self._extract_device_errors(status_data, static_data)
+            summary = status_msg.get('summary', {})
+            if not isinstance(summary, dict):
+                summary = {}
             
             return {
                 "ip": ip,
@@ -764,25 +870,30 @@ class DeviceMonitor:
             logging.error(f"{ip}: Ошибка получения данных: {str(e)}")
             return {"ip": ip, "online": False}
 
-    async def reboot_devices(self):
+    async def reboot_devices(self) -> int:
         if not self.selected_devices:
-            return
+            return 0
 
-        logging.info(f"Инициирована перезагрузка {len(self.selected_devices)} устройств")
-        for ip in self.selected_devices:
+        if self.operation_queue is None:
+            await self._init_async_resources()
+        queued_count = 0
+        for ip in sorted(self.selected_devices):
+            if ip in self.pending_operation_devices:
+                logging.warning(f"{ip}: Операция уже поставлена в очередь")
+                continue
+            self.pending_operation_devices.add(ip)
             await self.operation_queue.put((ip, "reboot"))
+            queued_count += 1
+        logging.info(f"Инициирована перезагрузка {queued_count} устройств")
+        return queued_count
 
     async def _reboot_device(self, ip: str):
         try:
-            salt = await self.get_salt(ip)
-            ts = int(time.time())
             resp = await self.send_command(ip, {
                 "cmd": "set.system.reboot",
-                "ts": ts,
-                "token": self.generate_token("set.system.reboot", salt, ts),
-                "account": self.current_account
             })
             if resp.get('code') == 0:
+                self.restarting_devices.add(ip)
                 self.operation_progress[ip] = ("reboot", time.time(), REBOOT_DURATION, "final")
                 logging.info(f"{ip}: Успешная перезагрузка")
             else:
@@ -790,32 +901,69 @@ class DeviceMonitor:
         except Exception as e:
             logging.exception(f"{ip}: Ошибка перезагрузки")
         finally:
-            await self.force_refresh_device(ip, delay=REBOOT_DURATION + 5)
+            if ip in self.restarting_devices:
+                try:
+                    await asyncio.sleep(REBOOT_DURATION + 5)
+                finally:
+                    self.restarting_devices.discard(ip)
+                await self.force_refresh_device(ip, delay=0)
 
-    async def update_firmware(self):
+    async def update_firmware(self) -> int:
         if not self.selected_devices:
-            return
+            return 0
 
         if not os.path.isfile(self.firmware_path) or not os.access(self.firmware_path, os.R_OK):
             logging.error(f"Файл прошивки недоступен для чтения: {self.firmware_path}")
-            return
+            return 0
 
         if os.path.getsize(self.firmware_path) == 0:
             logging.error(f"Файл прошивки пуст: {self.firmware_path}")
-            return
+            return 0
 
-        logging.info(f"Инициировано обновление {len(self.selected_devices)} устройств")
-        for ip in self.selected_devices:
+        if self.operation_queue is None:
+            await self._init_async_resources()
+        queued_count = 0
+        for ip in sorted(self.selected_devices):
+            if ip in self.pending_operation_devices:
+                logging.warning(f"{ip}: Операция уже поставлена в очередь")
+                continue
+            self.pending_operation_devices.add(ip)
             await self.operation_queue.put((ip, "update"))
+            queued_count += 1
+        logging.info(f"Инициировано обновление {queued_count} устройств")
+        return queued_count
     async def _update_device(self, ip: str):
         writer = None
+        firmware_file = None
+        api_slot_acquired = False
         previous_fw_version = None
         try:
+            if not ACCOUNTS.get(self.current_account):
+                raise ValidationError(
+                    f"Password for account {self.current_account!r} "
+                    "is not configured"
+                )
             device_before = await self.get_device_data(ip)
             if device_before.get("online"):
                 previous_fw_version = device_before.get("fw_version")
 
             salt = await self.get_salt(ip)
+            if not salt:
+                raise ValidationError("Could not retrieve device salt")
+
+            firmware_file = open(self.firmware_path, "rb")
+            firmware_size = os.fstat(firmware_file.fileno()).st_size
+            if firmware_size <= 0 or firmware_size > 0xFFFFFFFF:
+                raise ValidationError("Firmware size is outside the API range")
+            firmware_hash = hashlib.sha256()
+            while True:
+                chunk = firmware_file.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                firmware_hash.update(chunk)
+            firmware_sha256 = firmware_hash.hexdigest()
+            firmware_file.seek(0)
+
             ts = int(time.time())
             payload = {
                 "cmd": "set.system.update_firmware",
@@ -823,6 +971,8 @@ class DeviceMonitor:
                 "token": self.generate_token("set.system.update_firmware", salt, ts),
                 "account": self.current_account
             }
+            await self.api_semaphore.acquire()
+            api_slot_acquired = True
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(ip, API_PORT),
                 timeout=CONNECTION_TIMEOUT
@@ -838,13 +988,13 @@ class DeviceMonitor:
             init_resp = json.loads(
                 (await asyncio.wait_for(reader.readexactly(length), READ_TIMEOUT)).decode('ascii')
             )
-            if init_resp.get('msg') != "ready":
+            if (
+                not isinstance(init_resp, dict)
+                or init_resp.get("code") != 0
+                or init_resp.get('msg') != "ready"
+            ):
                 raise ConnectionError("Устройство не готово к обновлению")
 
-            with open(self.firmware_path, 'rb') as f:
-                firmware_data = f.read()
-            firmware_size = len(firmware_data)
-            firmware_sha256 = hashlib.sha256(firmware_data).hexdigest()
             logging.info(
                 f"{ip}: Образ для передачи: {firmware_size} байт, SHA-256 {firmware_sha256}"
             )
@@ -856,11 +1006,16 @@ class DeviceMonitor:
             sent = 0
             while sent < firmware_size:
                 chunk_size = min(CHUNK_SIZE, firmware_size - sent)
-                writer.write(firmware_data[sent:sent + chunk_size])
+                chunk = firmware_file.read(chunk_size)
+                if len(chunk) != chunk_size:
+                    raise CommandError("Firmware file changed during upload")
+                writer.write(chunk)
                 await writer.drain()
                 sent += chunk_size
                 progress = sent / firmware_size
                 self.operation_progress[ip] = ("update", time.time(), UPDATE_DURATION, f"upload {progress:.1%}")
+            firmware_file.close()
+            firmware_file = None
 
             response_prefix = await asyncio.wait_for(reader.readexactly(2), READ_TIMEOUT)
             if response_prefix.lower() == b"ok":
@@ -885,9 +1040,11 @@ class DeviceMonitor:
                     else:
                         raise CommandError("Invalid firmware completion response")
 
-            completion_code = completion_resp.get('code', completion_resp.get('Code'))
-            completion_msg = completion_resp.get('msg', completion_resp.get('Msg'))
-            successful_codes = (0, "0", 131, "131")
+            if not isinstance(completion_resp, dict):
+                raise CommandError("Invalid firmware completion response")
+            completion_code = completion_resp.get('code')
+            completion_msg = completion_resp.get('msg')
+            successful_codes = (0, "0")
             successful_messages = {"ok", "success"}
             if (
                 completion_code not in successful_codes
@@ -902,6 +1059,8 @@ class DeviceMonitor:
             writer.close()
             await writer.wait_closed()
             writer = None
+            self.api_semaphore.release()
+            api_slot_acquired = False
             self.operation_progress[ip] = ("update", time.time(), UPDATE_DURATION, "finalizing")
             await asyncio.sleep(UPDATE_DURATION)
 
@@ -923,10 +1082,19 @@ class DeviceMonitor:
             logging.error(f"{ip}: Ошибка обновления: {str(e)}", exc_info=True)
             self.operation_progress.pop(ip, None)
         finally:
+            if firmware_file:
+                firmware_file.close()
             if writer and not writer.is_closing():
                 writer.close()
-                await writer.wait_closed()
-            await self.force_refresh_device(ip, delay=30)
+                try:
+                    await writer.wait_closed()
+                except OSError:
+                    pass
+            if api_slot_acquired:
+                self.api_semaphore.release()
+            self.operation_progress.pop(ip, None)
+            if self.monitor_running:
+                await self.force_refresh_device(ip, delay=0)
 
     async def force_refresh_device(self, ip: str, delay: int = 5):
         await asyncio.sleep(delay)
@@ -960,97 +1128,150 @@ class DeviceMonitor:
                 break
             elif key in [ord('q'), 27]:
                 break
+            elif key == -1:
+                await asyncio.sleep(MONITOR_INTERVAL)
 
-    async def set_fan_mode(self, mode: str):
+    async def set_fan_mode(self, mode: str) -> bool:
+        if mode not in {"normal", "zero"}:
+            raise ValidationError(f"Unsupported fan mode: {mode}")
         if not self.selected_devices:
-            return
+            return False
 
+        success_count = 0
         for ip in self.selected_devices:
-            salt = await self.get_salt(ip)
-            ts = int(time.time())
             response = await self.send_command(ip, {
                 "cmd": "set.fan.zero_speed",
-                "ts": ts,
-                "token": self.generate_token("set.fan.zero_speed", salt, ts),
-                "account": self.current_account,
                 "param": 1 if mode == "zero" else 0
             })
             if response.get('code') == 0:
                 logging.info(f"{ip}: Режим вентиляторов изменен на {mode}")
+                success_count += 1
             else:
                 logging.error(f"{ip}: Ошибка изменения режима вентиляторов")
+        return success_count == len(self.selected_devices)
 
-    async def set_led_mode(self):
+    async def set_led_mode(self) -> bool:
         if not self.selected_devices:
-            return
+            return False
 
+        success_count = 0
         for ip in self.selected_devices:
-            salt = await self.get_salt(ip)
-            ts = int(time.time())
             response = await self.send_command(ip, {
                 "cmd": "set.system.led",
-                "ts": ts,
-                "token": self.generate_token("set.system.led", salt, ts),
-                "account": self.current_account,
-                "param": {
+                "param": [{
                     "color": "green",
                     "period": 1000,
                     "duration": 500,
                     "start": 0
-                }
+                }]
             })
             if response.get('code') == 0:
                 logging.info(f"{ip}: Настройки LED изменены")
+                success_count += 1
             else:
                 logging.error(f"{ip}: Ошибка изменения LED")
+        return success_count == len(self.selected_devices)
 
     async def send_command(self, ip: str, command: Dict, retries: int = COMMAND_RETRIES) -> Dict:
+        command_name = command.get("cmd")
+        if not isinstance(command_name, str):
+            return {"code": -3, "msg": "Command name is missing"}
+        if retries < 1:
+            return {"code": -1, "msg": "Retry count must be positive"}
+
+        is_write = command_name.startswith("set.")
+        if is_write and not ACCOUNTS.get(self.current_account):
+            return {
+                "code": -4,
+                "msg": (
+                    f"Password for account {self.current_account!r} "
+                    "is not configured"
+                ),
+            }
+
         for attempt in range(retries):
             writer = None
+            api_slot_acquired = False
             try:
                 payload = dict(command)
-                if payload['cmd'].startswith('set.'):
+                if is_write:
                     salt = await self.get_salt(ip)
+                    if not salt:
+                        return {
+                            "code": -1,
+                            "msg": "Could not retrieve device salt",
+                        }
                     ts = int(time.time())
                     payload.update({
                         "ts": ts,
-                        "token": self.generate_token(payload['cmd'], salt, ts),
+                        "token": self.generate_token(command_name, salt, ts),
                         "account": self.current_account
                     })
-                    if payload['cmd'] in ENCRYPTED_COMMANDS and not isinstance(payload.get('param'), str):
-                        payload['param'] = self.encrypt_param(payload['param'], payload['cmd'], salt, ts)
+                    if (
+                        command_name in ENCRYPTED_COMMANDS
+                        and not isinstance(payload.get("param"), str)
+                    ):
+                        payload["param"] = self.encrypt_param(
+                            payload["param"], command_name, salt, ts
+                        )
 
+                data = json.dumps(
+                    payload, ensure_ascii=True, separators=(",", ":")
+                ).encode("ascii")
+                if len(data) > 1024 * 1024:
+                    raise CommandError("Command payload is too large")
+
+                await self.api_semaphore.acquire()
+                api_slot_acquired = True
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(ip, API_PORT),
                     timeout=CONNECTION_TIMEOUT
                 )
-                
-                data = json.dumps(payload, ensure_ascii=True, separators=(',', ':')).encode('ascii')
-                if len(data) > 1024 * 1024:
-                    raise CommandError("Command payload is too large")
-                writer.write(len(data).to_bytes(4, 'little'))
-                await writer.drain()
-                writer.write(data)
+                writer.write(len(data).to_bytes(4, 'little') + data)
                 await writer.drain()
 
-                length_bytes = await asyncio.wait_for(reader.readexactly(4), READ_TIMEOUT)
+                length_bytes = await asyncio.wait_for(
+                    reader.readexactly(4), READ_TIMEOUT
+                )
                 length = int.from_bytes(length_bytes, 'little')
                 if length <= 0 or length > 1024 * 1024:
                     raise CommandError(f"Invalid response length: {length}")
-                response_data = await asyncio.wait_for(reader.readexactly(length), READ_TIMEOUT)
-                return json.loads(response_data.decode())
+                response_data = await asyncio.wait_for(
+                    reader.readexactly(length), READ_TIMEOUT
+                )
+                response = json.loads(response_data.decode('utf-8'))
+                if not isinstance(response, dict):
+                    raise CommandError("API response must be a JSON object")
+                if writer and not writer.is_closing():
+                    writer.close()
+                    try:
+                        await writer.wait_closed()
+                    except OSError:
+                        pass
+                    writer = None
+                self.api_semaphore.release()
+                api_slot_acquired = False
+                return response
                 
-            except (asyncio.TimeoutError, ConnectionError) as e:
-                if attempt == retries - 1:
-                    return {"code": -999, "msg": "Connection failed"}
+            except (
+                asyncio.TimeoutError,
+                asyncio.IncompleteReadError,
+                OSError,
+            ) as e:
+                if is_write or attempt == retries - 1:
+                    return {"code": -999, "msg": str(e) or "Connection failed"}
                 await asyncio.sleep(1)
             except Exception as e:
-                if attempt == retries - 1:
-                    return {"code": -1, "msg": str(e)}
+                return {"code": -1, "msg": str(e)}
             finally:
                 if writer and not writer.is_closing():
                     writer.close()
-                    await writer.wait_closed()
+                    try:
+                        await writer.wait_closed()
+                    except OSError:
+                        pass
+                if api_slot_acquired:
+                    self.api_semaphore.release()
         return {"code": -999, "msg": "Max retries exceeded"}
 
     async def get_salt(self, ip: str) -> str:
@@ -1059,8 +1280,15 @@ class DeviceMonitor:
         
         response = await self.send_command(ip, {"cmd": "get.device.info", "param": "salt"})
         if response.get('code') == 0:
-            self.salt_cache[ip] = response['msg'].get('salt', '')
-            return self.salt_cache[ip]
+            message = response.get("msg")
+            salt = (
+                message.get("salt", "")
+                if isinstance(message, dict)
+                else message if isinstance(message, str) else ""
+            )
+            if salt:
+                self.salt_cache[ip] = salt
+                return salt
         return ""
 
     def generate_token(self, cmd: str, salt: str, ts: int) -> str:
@@ -1095,11 +1323,9 @@ class DeviceMonitor:
 
     def validate_ip(self, ip: str) -> bool:
         """Валидировать IP адрес"""
-        parts = ip.split('.')
-        if len(parts) != 4:
-            return False
         try:
-            return all(0 <= int(part) <= 255 for part in parts)
+            ipaddress.IPv4Address(ip)
+            return True
         except ValueError:
             return False
 
@@ -1142,13 +1368,14 @@ class DeviceMonitor:
                 break
             elif key in [ord('q'), 27]:
                 break
+            elif key == -1:
+                await asyncio.sleep(MONITOR_INTERVAL)
 
     async def _set_power_limit_dialog(self, stdscr):
         h, w = stdscr.getmaxyx()
         win = curses.newwin(5, 40, h//2-2, w//2-20)
         win.border()
-        win.addstr(1, 2, "Лимит мощности (100-3000W):")
-        curses.echo()
+        win.addstr(1, 2, "Лимит мощности (0-99999W):")
         win.refresh()
         
         try:
@@ -1156,49 +1383,41 @@ class DeviceMonitor:
             if self.validate_power(power):
                 await self.set_power_limit(power)
             else:
-                logging.error(f"Некорректная мощность: {power}. Допустимый диапазон: 100-3000W")
+                logging.error(
+                    f"Некорректная мощность: {power}. "
+                    "Допустимый диапазон: 0-99999W"
+                )
         except (ValueError, ValidationError) as e:
             logging.error(f"Ошибка при установке лимита мощности: {str(e)}")
-        finally:
-            curses.noecho()
 
     async def _set_pools_dialog(self, stdscr):
         h, w = stdscr.getmaxyx()
-        win = curses.newwin(12, 70, h//2-6, w//2-35)
+        if h < 13 or w < 80:
+            logging.error("Терминал слишком мал для настройки пулов")
+            return
+        win = curses.newwin(13, 80, h//2-6, max(0, w//2-40))
         win.border()
-        win.addstr(1, 2, "Настройка пулов майнинга (введите 3 пула):")
+        win.addstr(1, 2, "Настройка пулов майнинга:")
         
         pools = []
-        try:
-            curses.echo()
-            for i in range(3):
-                win.addstr(3+i*3, 2, f"Пул {i+1}:")
-                win.addstr(4+i*3, 2, "URL: ")
-                url = self._get_input(win, 4+i*3, 7, 50)
-                win.addstr(5+i*3, 2, "Рабочий: ")
-                worker = self._get_input(win, 5+i*3, 11, 30)
-                win.addstr(6+i*3, 2, "Пароль: ")
-                password = self._get_input(win, 6+i*3, 10, 30)
-                
-                pools.append({
-                    "pool": url,
-                    "worker": worker,
-                    "passwd": password
-                })
-            win.refresh()
-        finally:
-            curses.noecho()
-        
-        if pools and pools[0]['pool']:  # Проверяем что хотя бы первый пул заполнен
-            await self.set_pools(pools)
+        for i in range(3):
+            row = 2 + i * 3
+            win.addstr(row, 2, f"Pool {i+1} URL:")
+            url = self._get_input(win, row, 14, 60)
+            win.addstr(row + 1, 2, "Worker:")
+            worker = self._get_input(win, row + 1, 14, 60)
+            win.addstr(row + 2, 2, "Password:")
+            password = self._get_input(win, row + 2, 14, 60, mask=True)
+            pools.append({"pool": url, "worker": worker, "passwd": password})
+
+        await self.set_pools(pools)
 
     async def _set_frequency_dialog(self, stdscr):
         """Диалог для установки частоты"""
         h, w = stdscr.getmaxyx()
         win = curses.newwin(5, 40, h//2-2, w//2-20)
         win.border()
-        win.addstr(1, 2, "Частота (50-100%):")
-        curses.echo()
+        win.addstr(1, 2, "Частота (-100..100%):")
         win.refresh()
         
         try:
@@ -1206,16 +1425,25 @@ class DeviceMonitor:
             if self.validate_frequency(freq):
                 await self.set_frequency(freq)
             else:
-                logging.error(f"Некорректная частота: {freq}. Допустимый диапазон: 50-100%")
+                logging.error(
+                    f"Некорректная частота: {freq}. "
+                    "Допустимый диапазон: -100..100%"
+                )
         except (ValueError, ValidationError) as e:
             logging.error(f"Ошибка при установке частоты: {str(e)}")
-        finally:
-            curses.noecho()
 
-    async def set_pools(self, pools: List[Dict]):
+    async def set_pools(self, pools: List[Dict]) -> bool:
         if not self.selected_devices:
-            return
+            return False
+        if not isinstance(pools, list) or len(pools) > 3:
+            raise ValidationError("One to three pool records are supported")
+        if any(not isinstance(pool, dict) for pool in pools):
+            raise ValidationError("Each pool must be an object")
+        pools = [pool for pool in pools if pool.get("pool")]
+        if not pools:
+            return False
 
+        success_count = 0
         for ip in self.selected_devices:
             response = await self.send_command(ip, {
                 "cmd": "set.miner.pools",
@@ -1223,8 +1451,10 @@ class DeviceMonitor:
             })
             if response.get('code') == 0:
                 logging.info(f"{ip}: Пулы успешно обновлены")
+                success_count += 1
             else:
                 logging.error(f"{ip}: Ошибка обновления пулов")
+        return success_count == len(self.selected_devices)
 
     def _draw_menu(self, stdscr, title, items, y, x):
         h = len(items) + 4
@@ -1238,7 +1468,7 @@ class DeviceMonitor:
         
         win.refresh()
 
-    def _get_input(self, win, y, x, max_len):
+    def _get_input(self, win, y, x, max_len, mask: bool = False):
         win.move(y, x)
         win.clrtoeol()
         input_str = ""
@@ -1250,68 +1480,69 @@ class DeviceMonitor:
                 input_str = input_str[:-1]
             elif len(input_str) < max_len and 32 <= ch <= 126:
                 input_str += chr(ch)
-            win.addstr(y, x, input_str.ljust(max_len))
+            displayed_input = "*" * len(input_str) if mask else input_str
+            win.addstr(y, x, displayed_input.ljust(max_len))
+            win.refresh()
         return input_str.strip()
 
-    async def set_power_mode(self, mode: str):
+    async def set_power_mode(self, mode: str) -> bool:
+        if mode not in {"normal", "low", "high"}:
+            raise ValidationError(f"Unsupported power mode: {mode}")
         if not self.selected_devices:
-            return
+            return False
 
+        success_count = 0
         for ip in self.selected_devices:
-            salt = await self.get_salt(ip)
-            ts = int(time.time())
             response = await self.send_command(ip, {
                 "cmd": "set.miner.power_mode",
-                "ts": ts,
-                "token": self.generate_token("set.miner.power_mode", salt, ts),
-                "account": self.current_account,
                 "param": mode
             })
             if response.get('code') == 0:
                 logging.info(f"{ip}: Режим питания изменен на {mode}")
+                success_count += 1
             else:
                 logging.error(f"{ip}: Ошибка изменения режима питания")
+        return success_count == len(self.selected_devices)
 
-    async def set_power_limit(self, power: int):
+    async def set_power_limit(self, power: int) -> bool:
         if not self.selected_devices:
-            return
+            return False
 
         if not self.validate_power(power):
-            logging.error(f"Неверное значение мощности {power}. Допустимый диапазон: 100-3000W")
+            logging.error(
+                f"Неверное значение мощности {power}. "
+                "Допустимый диапазон: 0-99999W"
+            )
             raise ValidationError(f"Неверное значение мощности: {power}")
 
+        success_count = 0
         for ip in self.selected_devices:
-            salt = await self.get_salt(ip)
-            ts = int(time.time())
             response = await self.send_command(ip, {
                 "cmd": "set.miner.power_limit",
-                "ts": ts,
-                "token": self.generate_token("set.miner.power_limit", salt, ts),
-                "account": self.current_account,
                 "param": power
             })
             if response.get('code') == 0:
                 logging.info(f"{ip}: Лимит питания установлен на {power}W")
+                success_count += 1
             else:
                 logging.error(f"{ip}: Ошибка установки лимита питания")
+        return success_count == len(self.selected_devices)
 
-    async def factory_reset(self):
+    async def factory_reset(self) -> bool:
         if not self.selected_devices:
-            return
+            return False
 
+        success_count = 0
         for ip in self.selected_devices:
-            salt = await self.get_salt(ip)
-            ts = int(time.time())
             response = await self.send_command(ip, {
                 "cmd": "set.system.factory_reset",
-                "ts": ts,
-                "token": self.generate_token("set.system.factory_reset", salt, ts),
-                "account": self.current_account
             })
             if response.get('code') == 0:
                 logging.info(f"{ip}: Сброс к заводским настройкам выполнен")
+                success_count += 1
             else:
                 logging.error(f"{ip}: Ошибка сброса настроек")
+        return success_count == len(self.selected_devices)
 
     async def set_frequency(self, frequency: int) -> bool:
         """Установить частоту майнинга (в процентах от базовой)"""
@@ -1319,19 +1550,17 @@ class DeviceMonitor:
             return False
 
         if not self.validate_frequency(frequency):
-            logging.error(f"Неверная частота {frequency}. Допустимый диапазон: 50-100%")
+            logging.error(
+                f"Неверная частота {frequency}. "
+                "Допустимый диапазон: -100..100%"
+            )
             raise ValidationError(f"Неверная частота: {frequency}")
 
         success_count = 0
         for ip in self.selected_devices:
             try:
-                salt = await self.get_salt(ip)
-                ts = int(time.time())
                 response = await self.send_command(ip, {
                     "cmd": "set.miner.target_freq",
-                    "ts": ts,
-                    "token": self.generate_token("set.miner.target_freq", salt, ts),
-                    "account": self.current_account,
                     "param": frequency
                 })
                 if response.get('code') == 0:
@@ -1342,29 +1571,75 @@ class DeviceMonitor:
             except Exception as e:
                 logging.error(f"{ip}: Ошибка установки частоты: {str(e)}")
 
-        return success_count > 0
+        return success_count == len(self.selected_devices)
 
 async def scan_network(network: str) -> List[str]:
+    try:
+        parsed_network = ipaddress.ip_network(network, strict=False)
+        if not isinstance(parsed_network, ipaddress.IPv4Network):
+            raise ValueError("Only IPv4 network ranges are supported")
+    except ValueError as exc:
+        raise ValidationError(
+            f"Invalid IPv4 network range: {network}"
+        ) from exc
+    if parsed_network.num_addresses > MAX_SCAN_ADDRESSES:
+        raise ValidationError(
+            f"Network is too large; maximum is {MAX_SCAN_ADDRESSES} addresses"
+        )
+
     nm = nmap.PortScanner()
-    print(f"Scanning {network}...")
-    await asyncio.to_thread(nm.scan, network, arguments=f'-p {API_PORT} --open')
-    devices = [host for host in nm.all_hosts() if nm[host]['tcp'][API_PORT]['state'] == 'open']
-    with open(CONFIG_FILE, 'w') as f:
+    print(f"Scanning {parsed_network}...")
+    await asyncio.to_thread(
+        nm.scan, str(parsed_network), arguments=f"-p {API_PORT} --open"
+    )
+    devices = []
+    for host in nm.all_hosts():
+        try:
+            ports = nm[host].get("tcp", {})
+            if ports.get(API_PORT, {}).get("state") == "open":
+                devices.append(str(ipaddress.IPv4Address(host)))
+        except (KeyError, TypeError, ValueError):
+            logging.warning("Ignoring invalid scan result host: %r", host)
+
+    devices = sorted(set(devices), key=ipaddress.IPv4Address)
+    temporary_config = f"{CONFIG_FILE}.tmp"
+    with open(temporary_config, "w", encoding="utf-8") as f:
         json.dump(devices, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary_config, CONFIG_FILE)
     print(f"Devices found: {len(devices)}")
     return devices
 
 def load_devices() -> List[str]:
     try:
         if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, 'r') as f:
-                return json.load(f)
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                configured_devices = json.load(f)
+            if not isinstance(configured_devices, list):
+                raise ValueError("Device configuration must be a JSON array")
+
+            devices = set()
+            for value in configured_devices:
+                if not isinstance(value, str):
+                    logging.warning(
+                        "Ignoring non-string device address: %r", value
+                    )
+                    continue
+                try:
+                    devices.add(str(ipaddress.IPv4Address(value)))
+                except ipaddress.AddressValueError:
+                    logging.warning(
+                        "Ignoring invalid IPv4 device address: %r", value
+                    )
+            return sorted(devices, key=ipaddress.IPv4Address)
         return []
     except Exception as e:
         logging.error(f"Failed to load devices: {str(e)}")
         return []
 
 def main():
+    configure_logging()
     parser = argparse.ArgumentParser(description="ASIC device monitoring")
     parser.add_argument("--scan", help="Network range to scan")
     parser.add_argument("--firmware", default=DEFAULT_FIRMWARE, help="Path to firmware file")

@@ -11,14 +11,14 @@ ASIC Monitor is a command-line interface (CLI) tool designed to monitor and mana
     * Update firmware on multiple devices.
     * Set zero-speed fan mode (air-cooled devices only).
     * Control LED indicators.
-    * Adjust power modes (normal, economic, high performance).
+    * Adjust power modes (normal, low, high).
     * Set power limits.
     * Configure mining pools.
     * Perform factory reset.
 * **Interactive UI**: `curses`-based interface for easy navigation and selection.
 * **Network Scanning**: Discover ASIC devices on your network.
 * **Encrypted Communication**: Encrypts pool parameters and authenticates write commands according to the documented token flow.
-* **Detailed Device View**: Toggle to see comprehensive information for a selected device, including pool details.
+* **Detailed Device View**: Toggle to see device information, pool status, and decoded device error codes.
 * **Operation Progress Bars**: Visual feedback for long-running tasks like firmware updates.
 * **Logging**: Logs all activities and errors to a file (`asic_monitor.log`).
 
@@ -113,18 +113,19 @@ ASIC Monitor is a command-line interface (CLI) tool designed to monitor and mana
 | :---------- | :------------------------------- | :---------------------------------------------- |
 | `↑` / `↓`   | Navigate                         | Move selection up/down                          |
 | `Space`     | Toggle Selection                 | Select/Deselect the current device              |
-| `A`         | Select/Deselect All              | Toggle selection for all listed devices         |
-| `R`         | Reboot Devices                   | Initiate a reboot for all selected devices      |
-| `U`         | Update Firmware                  | Initiate a firmware update for selected devices |
+| `a`         | Select/Deselect All              | Toggle selection for all listed devices         |
+| `r`         | Reboot Devices                   | Initiate a reboot for all selected devices      |
+| `u`         | Update Firmware                  | Initiate a firmware update for selected devices |
 | `p`         | Pause Monitoring                 | Pause/Resume real-time data updates             |
 | `f`         | Fan Control Menu                 | Access menu for fan speed settings              |
 | `l`         | Set LED Mode                     | Change LED indicator settings                   |
-| `M`         | Power Mode Menu                  | Access menu for power modes (normal, economic, high) |
+| `m`         | Power Mode Menu                  | Access menu for power modes (normal, low, high) |
 | `L`         | Set Power Limit                  | Set a power consumption limit (0-99999 W)       |
 | `P`         | Set Pools                        | Configure mining pool settings                  |
-| `D`         | Toggle Detailed View             | Switch between list view and detailed view for selected device |
+| `d`         | Toggle Detailed View             | Switch between list view and detailed view for selected device |
+| `C`         | Set Frequency                    | Set target frequency (-100..100%)                |
 | `F`         | Factory Reset                    | Perform a factory reset on selected devices     |
-| `Q` / `Esc` | Quit                             | Exit the application                            |
+| `q` / `Esc` | Quit                             | Exit the application                            |
 
 The tool intentionally does not expose voltage control, arbitrary log reading,
 configuration backup/restore, USB inspection, thermal throttling, statistics

@@ -142,9 +142,7 @@ def _help_text() -> str:
         "/status [IP ...] — device status, sorted by hashrate\n"
         "/devices [IP ...] — alias for /status\n"
         "/reboot [IP ...] — reboot devices\n"
-        "/frequency &lt;-100..100&gt; [IP ...] — set frequency\n"
         "/power &lt;0..99999&gt; [IP ...] — set power limit\n"
-        "/fan &lt;normal|zero&gt; [IP ...] — set fan mode\n"
         "/mode &lt;normal|low|high&gt; [IP ...] — set power mode\n"
         "/help — this help\n\n"
         "Without IP list, command applies to all devices."
@@ -228,12 +226,6 @@ class TelegramBot:
             await update.effective_message.reply_text(str(exc))
 
     @authorized
-    async def frequency(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await self._run_numeric_command(
-            update, context, "frequency", "frequency", self.monitor.set_frequency
-        )
-
-    @authorized
     async def power(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._run_numeric_command(
             update, context, "power", "power limit", self.monitor.set_power_limit
@@ -268,31 +260,13 @@ class TelegramBot:
             "/status [IP ...] — device status, sorted by hashrate\n"
             "/devices [IP ...] — alias for /status\n"
             "/reboot [IP ...] — reboot devices\n"
-            "/frequency &lt;value&gt; [IP ...] — set frequency\n"
             "/power &lt;value&gt; [IP ...] — set power limit\n"
-            "/fan normal|zero [IP ...] — set fan mode\n"
             "/mode normal|low|high [IP ...] — set performance mode\n"
             "/help — show help text\n"
         )
         await update.effective_message.reply_text(
             message, parse_mode="HTML", disable_web_page_preview=True
         )
-
-    @authorized
-    async def fan(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        try:
-            if not context.args or context.args[0] not in {"normal", "zero"}:
-                raise ValueError("Usage: /fan normal|zero [IP ...]")
-            async with self.operation_lock:
-                self.monitor.selected_devices = _selected_devices(
-                    self.monitor, context.args[1:]
-                )
-                succeeded = await self.monitor.set_fan_mode(context.args[0])
-            if not succeeded:
-                raise DeviceError("Not all devices accepted the fan command.")
-            await update.effective_message.reply_text("Fan mode changed.")
-        except (ValueError, DeviceError) as exc:
-            await update.effective_message.reply_text(f"Error: {exc}")
 
     async def _run_numeric_command(
         self,
@@ -362,9 +336,7 @@ def build_application(monitor: DeviceMonitor) -> Application:
     application.add_handler(CommandHandler("status", bot.status))
     application.add_handler(CommandHandler("devices", bot.status))
     application.add_handler(CommandHandler("reboot", bot.reboot))
-    application.add_handler(CommandHandler("frequency", bot.frequency))
     application.add_handler(CommandHandler("power", bot.power))
-    application.add_handler(CommandHandler("fan", bot.fan))
     application.add_handler(CommandHandler("mode", bot.mode))
     application.add_handler(CommandHandler("powermode", bot.mode))
     application.add_handler(CommandHandler("menu", bot.menu))

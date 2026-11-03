@@ -1,15 +1,13 @@
 README.md
 # ASIC Monitor
 
-ASIC Monitor is a command-line interface (CLI) tool designed to monitor and manage ASIC mining devices. It provides real-time statistics, allows for mass operations like rebooting and firmware updates, and offers detailed insights into individual devices. The interface is built using `curses` for an interactive terminal experience.
+ASIC Monitor is a command-line interface (CLI) tool for monitoring and managing ASIC mining devices. It provides real-time statistics, device-level fault history, and detailed insights into individual devices. The interface is built using `curses` for an interactive terminal experience.
 
 ## Features
 
 * **Real-time Monitoring**: Displays live status, hashrate, temperature, power consumption, and fan speeds of your ASIC devices.
 * **Device Management**:
     * Reboot selected devices.
-    * Update firmware on multiple devices.
-    * Set zero-speed fan mode (air-cooled devices only).
     * Control LED indicators.
     * Adjust power modes (normal, low, high).
     * Set power limits.
@@ -19,8 +17,9 @@ ASIC Monitor is a command-line interface (CLI) tool designed to monitor and mana
 * **Network Scanning**: Discover ASIC devices on your network.
 * **Encrypted Communication**: Encrypts pool parameters and authenticates write commands according to the documented token flow.
 * **Detailed Device View**: Toggle to see device information, pool status, and decoded device error codes.
-* **Operation Progress Bars**: Visual feedback for long-running tasks like firmware updates.
 * **Logging**: Logs all activities and errors to a file (`asic_monitor.log`).
+* **Fault History**: Records fault and connectivity transitions with UTC date/time in `asic_faults.sqlite3`.
+* **Fault Charts**: Prints per-device hourly or daily fault counts for a day, week, or month.
 
 ## Installation
 
@@ -61,9 +60,6 @@ ASIC Monitor is a command-line interface (CLI) tool designed to monitor and mana
     Never publish the token. An allowlist is required; an empty allowlist
     prevents the bot from starting.
 
-5.  **Place Firmware File (for updates)**:
-    If you plan to use the firmware update feature, place your firmware `.bin` file in the same directory as `asic.py` or specify its path using the `--firmware` argument. The default firmware file name is `firmware.bin`.
-
 ## Usage
 
 1.  **First-time setup (scan your network)**:
@@ -80,11 +76,13 @@ ASIC Monitor is a command-line interface (CLI) tool designed to monitor and mana
     ```
     The monitor will load devices from `asic_devices.json`.
 
-3.  **Specify Firmware Path (optional)**:
-    If your firmware file is not named `firmware.bin` or is in a different location:
+3.  **View fault charts**:
     ```bash
-    python3 asic.py --firmware /path/to/your/firmware_file.bin
+    python3 asic.py --fault-chart --period day
+    python3 asic.py --fault-chart --device 192.168.1.101 --period week
+    python3 asic.py --fault-chart --period month
     ```
+    Without `--device`, a separate chart is printed for every configured miner. The first run records new events from that point onward; older faults are not reconstructed.
 
 4.  **Start the Telegram bot**:
     ```bash
@@ -115,24 +113,17 @@ ASIC Monitor is a command-line interface (CLI) tool designed to monitor and mana
 | `Space`     | Toggle Selection                 | Select/Deselect the current device              |
 | `a`         | Select/Deselect All              | Toggle selection for all listed devices         |
 | `r`         | Reboot Devices                   | Initiate a reboot for all selected devices      |
-| `u`         | Update Firmware                  | Initiate a firmware update for selected devices |
 | `p`         | Pause Monitoring                 | Pause/Resume real-time data updates             |
-| `f`         | Fan Control Menu                 | Access menu for fan speed settings              |
 | `l`         | Set LED Mode                     | Change LED indicator settings                   |
 | `m`         | Power Mode Menu                  | Access menu for power modes (normal, low, high) |
 | `L`         | Set Power Limit                  | Set a power consumption limit (0-99999 W)       |
 | `P`         | Set Pools                        | Configure mining pool settings                  |
 | `d`         | Toggle Detailed View             | Switch between list view and detailed view for selected device |
-| `C`         | Set Frequency                    | Set target frequency (-100..100%)                |
 | `F`         | Factory Reset                    | Perform a factory reset on selected devices     |
 | `q` / `Esc` | Quit                             | Exit the application                            |
 
-The tool intentionally does not expose voltage control, arbitrary log reading,
-configuration backup/restore, USB inspection, thermal throttling, statistics
-reset, or automatic recovery: these commands are not present in the current
-official WhatsMiner API command list. Frequency control uses the documented
-`set.miner.target_freq` range of `-100..100`; positive increases may be limited
-on air-cooled devices.
+Firmware updates, frequency changes, and fan control are intentionally not
+available. Fan speed and target frequency remain visible as read-only telemetry.
 
 ## Technologies Used
 

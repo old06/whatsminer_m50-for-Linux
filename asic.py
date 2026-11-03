@@ -9,6 +9,9 @@ import os
 import logging
 import asyncio
 import ipaddress
+import sqlite3
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from logging.handlers import TimedRotatingFileHandler
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
@@ -31,14 +34,12 @@ ACCOUNTS = {
 MONITOR_INTERVAL = 0.05
 STATS_UPDATE_INTERVAL = 1
 REBOOT_DURATION = 60
-UPDATE_DURATION = 300
 MAX_CONCURRENT_OPS = 10
 MAX_SCAN_ADDRESSES = 65536
 COMMAND_RETRIES = 3
 CONNECTION_TIMEOUT = 15
 READ_TIMEOUT = 50
-CHUNK_SIZE = 4096
-DEFAULT_FIRMWARE = os.path.join(BASE_DIR, "firmware.bin")
+FAULT_DB_FILE = os.path.join(BASE_DIR, "asic_faults.sqlite3")
 ENCRYPTED_COMMANDS = {'set.miner.pools', 'set.user.change_passwd', 'set.miner.power_percent'}
 OVERHEAT_TEMP = 80  # Температура перегрева
 ERROR_CODE_INFO = {
@@ -255,6 +256,100 @@ def configure_logging():
         logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
+
+class FaultJournal:
+    def __init__(self, path: str = FAULT_DB_FILE):
+        self.path = path
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS active_faults (
+                    ip TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    PRIMARY KEY (ip, code)
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS fault_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ip TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (state IN ('raised', 'cleared'))
+                )"""
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS fault_events_time_idx "
+                "ON fault_events (occurred_at, ip, state)"
+            )
+            connection.commit()
+
+    def record_snapshot(self, device: Dict) -> None:
+        ip = device["ip"]
+        current = {
+            str(error.get("code", "UNKNOWN")): str(
+                error.get("description", "Неизвестная неисправность")
+            )
+            for error in device.get("errors", [])
+        }
+        if not device.get("online"):
+            current["CONNECTION"] = "Устройство недоступно"
+
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            previous = dict(connection.execute(
+                "SELECT code, description FROM active_faults WHERE ip = ?",
+                (ip,),
+            ))
+            for code, description in current.items():
+                if code not in previous:
+                    connection.execute(
+                        "INSERT INTO fault_events "
+                        "(ip, occurred_at, code, description, state) "
+                        "VALUES (?, ?, ?, ?, 'raised')",
+                        (ip, timestamp, code, description),
+                    )
+                    connection.execute(
+                        "INSERT INTO active_faults (ip, code, description) "
+                        "VALUES (?, ?, ?)",
+                        (ip, code, description),
+                    )
+                elif previous[code] != description:
+                    connection.execute(
+                        "UPDATE active_faults SET description = ? "
+                        "WHERE ip = ? AND code = ?",
+                        (description, ip, code),
+                    )
+            for code in previous.keys() - current.keys():
+                connection.execute(
+                    "INSERT INTO fault_events "
+                    "(ip, occurred_at, code, description, state) "
+                    "VALUES (?, ?, ?, ?, 'cleared')",
+                    (ip, timestamp, code, previous[code]),
+                )
+                connection.execute(
+                    "DELETE FROM active_faults WHERE ip = ? AND code = ?",
+                    (ip, code),
+                )
+            connection.commit()
+
+    def raised_events_since(self, ip: str, since: datetime) -> List[str]:
+        with closing(sqlite3.connect(self.path)) as connection:
+            return [row[0] for row in connection.execute(
+                "SELECT occurred_at FROM fault_events "
+                "WHERE ip = ? AND state = 'raised' AND occurred_at >= ? "
+                "ORDER BY occurred_at",
+                (
+                    ip,
+                    since.astimezone(timezone.utc).isoformat(
+                        timespec="seconds"
+                    ),
+                ),
+            )]
+
+
 class DeviceError(Exception):
     """Базовое исключение для ошибок устройства"""
     pass
@@ -287,7 +382,7 @@ class DeviceMonitor:
         self.operation_queue = None
         self.pending_operation_devices: Set[str] = set()
         self.operation_progress: Dict[str, Tuple] = {}
-        self.firmware_path = DEFAULT_FIRMWARE
+        self.fault_journal = FaultJournal()
         self.lock = None
         self.api_semaphore = asyncio.Semaphore(MAX_CONCURRENT_OPS)
         self.restarting_devices: Set[str] = set()
@@ -356,21 +451,10 @@ class DeviceMonitor:
                 self._handle_key_down(stdscr)
             elif key == ord(' '):
                 self._toggle_device_selection()
-            elif key == ord('a'):
-                self._toggle_all_devices()
             elif key == ord('r'):
                 await self.reboot_devices()
-            elif key == ord('u'):
-                if await self._confirm_action(
-                    stdscr,
-                    "Upload firmware to "
-                    f"{len(self.selected_devices)} device(s)? [y/N]",
-                ):
-                    await self.update_firmware()
             elif key == ord('p'):
                 self.monitor_paused = not self.monitor_paused
-            elif key == ord('f'):
-                await self._show_fan_menu(stdscr)
             elif key == ord('l'):
                 await self.set_led_mode()
             elif key == ord('m'):
@@ -388,8 +472,6 @@ class DeviceMonitor:
                     f"{len(self.selected_devices)} device(s)? [y/N]",
                 ):
                     await self.factory_reset()
-            elif key == ord('C'):
-                await self._set_frequency_dialog(stdscr)
             key = stdscr.getch()
 
     async def _confirm_action(self, stdscr, prompt: str) -> bool:
@@ -594,8 +676,8 @@ class DeviceMonitor:
         self._draw_progress_bars(stdscr, h, w)
         
         help_text = (
-            "[Space]Выбор [a]Все [r]Рестарт [u]Прошивка [f]Вент [l]LED "
-            "[m]Режим [L]Лимит [P]Пулы [d]Детали [C]Частота [F]Сброс [q]Выход"
+            "[Space]Выбор [a]Все [r]Рестарт [l]LED [m]Режим "
+            "[L]Лимит [P]Пулы [d]Детали [F]Сброс [q]Выход"
         )
         self._safe_addstr(stdscr, h-1, 0, help_text.ljust(w-1), curses.A_REVERSE)
         stdscr.refresh()
@@ -792,14 +874,8 @@ class DeviceMonitor:
     def _draw_progress_bars(self, stdscr, h, w):
         progress_y = h - 4
         for ip, (op_type, start, duration, stage) in self.operation_progress.items():
-            if isinstance(stage, str) and stage.startswith("upload "):
-                try:
-                    progress = float(stage[7:].rstrip("%")) / 100
-                except ValueError:
-                    progress = 0
-            else:
-                elapsed = time.time() - start
-                progress = min(elapsed / duration, 1.0) if duration > 0 else 0
+            elapsed = time.time() - start
+            progress = min(elapsed / duration, 1.0) if duration > 0 else 0
             bar_width = int(w * 0.6)
             filled = int(bar_width * progress)
             bar = '█' * filled + '-' * (bar_width - filled)
@@ -814,8 +890,6 @@ class DeviceMonitor:
             try:
                 if operation == "reboot":
                     await self._reboot_device(ip)
-                elif operation == "update":
-                    await self._update_device(ip)
             finally:
                 self.operation_queue.task_done()
                 self.pending_operation_devices.discard(ip)
@@ -840,11 +914,15 @@ class DeviceMonitor:
             try:
                 tasks = [self.get_device_data(ip) for ip in self.devices]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
+                valid_results = [
+                    result for result in results
+                    if not isinstance(result, Exception)
+                ]
+                for device in valid_results:
+                    self.fault_journal.record_snapshot(device)
                 
                 async with self.lock:
-                    self.stats_cache["all_devices"] = [
-                        r for r in results if not isinstance(r, Exception)
-                    ]
+                    self.stats_cache["all_devices"] = valid_results
                 self.last_stat_update = time.time()
             except Exception as e:
                 logging.error(f"Ошибка обновления статистики: {str(e)}")
@@ -959,194 +1037,6 @@ class DeviceMonitor:
                     self.restarting_devices.discard(ip)
                 await self.force_refresh_device(ip, delay=0)
 
-    async def update_firmware(self) -> int:
-        if not self.selected_devices:
-            return 0
-
-        if not os.path.isfile(self.firmware_path) or not os.access(self.firmware_path, os.R_OK):
-            logging.error(f"Файл прошивки недоступен для чтения: {self.firmware_path}")
-            return 0
-
-        if os.path.getsize(self.firmware_path) == 0:
-            logging.error(f"Файл прошивки пуст: {self.firmware_path}")
-            return 0
-
-        if self.operation_queue is None:
-            await self._init_async_resources()
-        queued_count = 0
-        for ip in sorted(self.selected_devices):
-            if ip in self.pending_operation_devices:
-                logging.warning(f"{ip}: Операция уже поставлена в очередь")
-                continue
-            self.pending_operation_devices.add(ip)
-            await self.operation_queue.put((ip, "update"))
-            queued_count += 1
-        logging.info(f"Инициировано обновление {queued_count} устройств")
-        return queued_count
-    async def _update_device(self, ip: str):
-        writer = None
-        firmware_file = None
-        api_slot_acquired = False
-        previous_fw_version = None
-        try:
-            if not ACCOUNTS.get(self.current_account):
-                raise ValidationError(
-                    f"Password for account {self.current_account!r} "
-                    "is not configured"
-                )
-            device_before = await self.get_device_data(ip)
-            if device_before.get("online"):
-                previous_fw_version = device_before.get("fw_version")
-
-            salt = await self.get_salt(ip)
-            if not salt:
-                raise ValidationError("Could not retrieve device salt")
-
-            firmware_file = open(self.firmware_path, "rb")
-            firmware_size = os.fstat(firmware_file.fileno()).st_size
-            if firmware_size <= 0 or firmware_size > 0xFFFFFFFF:
-                raise ValidationError("Firmware size is outside the API range")
-            firmware_hash = hashlib.sha256()
-            while True:
-                chunk = firmware_file.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                firmware_hash.update(chunk)
-            firmware_sha256 = firmware_hash.hexdigest()
-            firmware_file.seek(0)
-
-            ts = int(time.time())
-            payload = {
-                "cmd": "set.system.update_firmware",
-                "ts": ts,
-                "token": self.generate_token("set.system.update_firmware", salt, ts),
-                "account": self.current_account
-            }
-            await self.api_semaphore.acquire()
-            api_slot_acquired = True
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, API_PORT),
-                timeout=CONNECTION_TIMEOUT
-            )
-            data = json.dumps(payload, ensure_ascii=True, separators=(',', ':')).encode('ascii')
-            writer.write(len(data).to_bytes(4, 'little') + data)
-            await writer.drain()
-            length = int.from_bytes(
-                await asyncio.wait_for(reader.readexactly(4), READ_TIMEOUT), 'little'
-            )
-            if length <= 0 or length > 1024 * 1024:
-                raise CommandError(f"Invalid firmware response length: {length}")
-            init_resp = json.loads(
-                (await asyncio.wait_for(reader.readexactly(length), READ_TIMEOUT)).decode('ascii')
-            )
-            if (
-                not isinstance(init_resp, dict)
-                or init_resp.get("code") != 0
-                or init_resp.get('msg') != "ready"
-            ):
-                raise ConnectionError("Устройство не готово к обновлению")
-
-            logging.info(
-                f"{ip}: Образ для передачи: {firmware_size} байт, SHA-256 {firmware_sha256}"
-            )
-
-            writer.write(firmware_size.to_bytes(4, 'little'))
-            await writer.drain()
-
-            # Отправка данных прошивки
-            sent = 0
-            while sent < firmware_size:
-                chunk_size = min(CHUNK_SIZE, firmware_size - sent)
-                chunk = firmware_file.read(chunk_size)
-                if len(chunk) != chunk_size:
-                    raise CommandError("Firmware file changed during upload")
-                writer.write(chunk)
-                await writer.drain()
-                sent += chunk_size
-                progress = sent / firmware_size
-                self.operation_progress[ip] = ("update", time.time(), UPDATE_DURATION, f"upload {progress:.1%}")
-            firmware_file.close()
-            firmware_file = None
-
-            response_prefix = await asyncio.wait_for(reader.readexactly(2), READ_TIMEOUT)
-            if response_prefix.lower() == b"ok":
-                completion_resp = {"code": 0, "msg": "ok"}
-            else:
-                length_bytes = response_prefix + await asyncio.wait_for(
-                    reader.readexactly(2), READ_TIMEOUT
-                )
-                length = int.from_bytes(length_bytes, 'little')
-                if length <= 0 or length > 1024 * 1024:
-                    raise CommandError(
-                        f"Invalid firmware completion response length: {length}"
-                    )
-                response_data = await asyncio.wait_for(
-                    reader.readexactly(length), READ_TIMEOUT
-                )
-                try:
-                    completion_resp = json.loads(response_data.decode('ascii'))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    if response_data.strip().lower() in {b"ok", b"success"}:
-                        completion_resp = {"code": 0, "msg": "ok"}
-                    else:
-                        raise CommandError("Invalid firmware completion response")
-
-            if not isinstance(completion_resp, dict):
-                raise CommandError("Invalid firmware completion response")
-            completion_code = completion_resp.get('code')
-            completion_msg = completion_resp.get('msg')
-            successful_codes = (0, "0")
-            successful_messages = {"ok", "success"}
-            if (
-                completion_code not in successful_codes
-                and str(completion_msg).strip().lower() not in successful_messages
-            ):
-                raise CommandError(
-                    "Устройство отклонило прошивку: "
-                    f"code={completion_code}, msg={completion_msg}"
-                )
-
-            logging.info(f"{ip}: API завершил прием файла; ожидаются проверка пакета и перезагрузка")
-            writer.close()
-            await writer.wait_closed()
-            writer = None
-            self.api_semaphore.release()
-            api_slot_acquired = False
-            self.operation_progress[ip] = ("update", time.time(), UPDATE_DURATION, "finalizing")
-            await asyncio.sleep(UPDATE_DURATION)
-
-            device_after = await self.get_device_data(ip)
-            if not device_after.get("online"):
-                logging.warning(f"{ip}: Устройство недоступно после передачи; обновление не подтверждено")
-            elif previous_fw_version and device_after.get("fw_version") != previous_fw_version:
-                logging.info(
-                    f"{ip}: Прошивка обновлена: {previous_fw_version} -> {device_after.get('fw_version')}"
-                )
-            elif previous_fw_version:
-                logging.warning(
-                    f"{ip}: Версия прошивки не изменилась ({previous_fw_version}); обновление не подтверждено"
-                )
-            else:
-                logging.warning(f"{ip}: Не удалось проверить версию прошивки после передачи")
-        
-        except Exception as e:
-            logging.error(f"{ip}: Ошибка обновления: {str(e)}", exc_info=True)
-            self.operation_progress.pop(ip, None)
-        finally:
-            if firmware_file:
-                firmware_file.close()
-            if writer and not writer.is_closing():
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except OSError:
-                    pass
-            if api_slot_acquired:
-                self.api_semaphore.release()
-            self.operation_progress.pop(ip, None)
-            if self.monitor_running:
-                await self.force_refresh_device(ip, delay=0)
-
     async def force_refresh_device(self, ip: str, delay: int = 5):
         await asyncio.sleep(delay)
         try:
@@ -1158,48 +1048,6 @@ class DeviceMonitor:
                         break
         except Exception as e:
             logging.error(f"{ip}: Ошибка обновления данных: {str(e)}")
-
-    async def _show_fan_menu(self, stdscr):
-        menu_items = [
-            ("1", "Нормальный режим", "normal"),
-            ("2", "Режим нулевой скорости", "zero"),
-            ("q", "Назад", None)
-        ]
-        
-        h, w = stdscr.getmaxyx()
-        self._draw_menu(stdscr, "УПРАВЛЕНИЕ ВЕНТИЛЯТОРАМИ:", menu_items, h//2-3, w//2-15)
-        
-        while True:
-            key = stdscr.getch()
-            if key == ord('1'):
-                await self.set_fan_mode("normal")
-                break
-            elif key == ord('2'):
-                await self.set_fan_mode("zero")
-                break
-            elif key in [ord('q'), 27]:
-                break
-            elif key == -1:
-                await asyncio.sleep(MONITOR_INTERVAL)
-
-    async def set_fan_mode(self, mode: str) -> bool:
-        if mode not in {"normal", "zero"}:
-            raise ValidationError(f"Unsupported fan mode: {mode}")
-        if not self.selected_devices:
-            return False
-
-        success_count = 0
-        for ip in self.selected_devices:
-            response = await self.send_command(ip, {
-                "cmd": "set.fan.zero_speed",
-                "param": 1 if mode == "zero" else 0
-            })
-            if response.get('code') == 0:
-                logging.info(f"{ip}: Режим вентиляторов изменен на {mode}")
-                success_count += 1
-            else:
-                logging.error(f"{ip}: Ошибка изменения режима вентиляторов")
-        return success_count == len(self.selected_devices)
 
     async def set_led_mode(self) -> bool:
         if not self.selected_devices:
@@ -1227,6 +1075,12 @@ class DeviceMonitor:
         command_name = command.get("cmd")
         if not isinstance(command_name, str):
             return {"code": -3, "msg": "Command name is missing"}
+        if command_name in {
+            "set.system.update_firmware",
+            "set.miner.target_freq",
+            "set.fan.zero_speed",
+        }:
+            return {"code": -4, "msg": "This device command is disabled"}
         if retries < 1:
             return {"code": -1, "msg": "Retry count must be positive"}
 
@@ -1380,10 +1234,6 @@ class DeviceMonitor:
         except ValueError:
             return False
 
-    def validate_frequency(self, freq: int) -> bool:
-        """Валидировать значение частоты"""
-        return -100 <= freq <= 100
-
     def validate_power(self, power: int) -> bool:
         """Валидировать значение мощности"""
         return 0 <= power <= 99999
@@ -1440,48 +1290,6 @@ class DeviceMonitor:
                 )
         except (ValueError, ValidationError) as e:
             logging.error(f"Ошибка при установке лимита мощности: {str(e)}")
-
-    async def _set_pools_dialog(self, stdscr):
-        h, w = stdscr.getmaxyx()
-        if h < 13 or w < 80:
-            logging.error("Терминал слишком мал для настройки пулов")
-            return
-        win = curses.newwin(13, 80, h//2-6, max(0, w//2-40))
-        win.border()
-        win.addstr(1, 2, "Настройка пулов майнинга:")
-        
-        pools = []
-        for i in range(3):
-            row = 2 + i * 3
-            win.addstr(row, 2, f"Pool {i+1} URL:")
-            url = self._get_input(win, row, 14, 60)
-            win.addstr(row + 1, 2, "Worker:")
-            worker = self._get_input(win, row + 1, 14, 60)
-            win.addstr(row + 2, 2, "Password:")
-            password = self._get_input(win, row + 2, 14, 60, mask=True)
-            pools.append({"pool": url, "worker": worker, "passwd": password})
-
-        await self.set_pools(pools)
-
-    async def _set_frequency_dialog(self, stdscr):
-        """Диалог для установки частоты"""
-        h, w = stdscr.getmaxyx()
-        win = curses.newwin(5, 40, h//2-2, w//2-20)
-        win.border()
-        win.addstr(1, 2, "Частота (-100..100%):")
-        win.refresh()
-        
-        try:
-            freq = int(self._get_input(win, 2, 2, 10))
-            if self.validate_frequency(freq):
-                await self.set_frequency(freq)
-            else:
-                logging.error(
-                    f"Некорректная частота: {freq}. "
-                    "Допустимый диапазон: -100..100%"
-                )
-        except (ValueError, ValidationError) as e:
-            logging.error(f"Ошибка при установке частоты: {str(e)}")
 
     async def set_pools(self, pools: List[Dict]) -> bool:
         if not self.selected_devices:
@@ -1595,35 +1403,6 @@ class DeviceMonitor:
                 logging.error(f"{ip}: Ошибка сброса настроек")
         return success_count == len(self.selected_devices)
 
-    async def set_frequency(self, frequency: int) -> bool:
-        """Установить частоту майнинга (в процентах от базовой)"""
-        if not self.selected_devices:
-            return False
-
-        if not self.validate_frequency(frequency):
-            logging.error(
-                f"Неверная частота {frequency}. "
-                "Допустимый диапазон: -100..100%"
-            )
-            raise ValidationError(f"Неверная частота: {frequency}")
-
-        success_count = 0
-        for ip in self.selected_devices:
-            try:
-                response = await self.send_command(ip, {
-                    "cmd": "set.miner.target_freq",
-                    "param": frequency
-                })
-                if response.get('code') == 0:
-                    logging.info(f"{ip}: Частота установлена на {frequency}%")
-                    success_count += 1
-                else:
-                    logging.error(f"{ip}: Ошибка установки частоты: {response.get('msg')}")
-            except Exception as e:
-                logging.error(f"{ip}: Ошибка установки частоты: {str(e)}")
-
-        return success_count == len(self.selected_devices)
-
 async def scan_network(network: str) -> List[str]:
     try:
         parsed_network = ipaddress.ip_network(network, strict=False)
@@ -1689,12 +1468,48 @@ def load_devices() -> List[str]:
         logging.error(f"Failed to load devices: {str(e)}")
         return []
 
+def print_fault_chart(journal: FaultJournal, ip: str, period: str) -> None:
+    now = datetime.now().astimezone()
+    if period == "day":
+        bucket_count = 24
+        bucket_start = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=23)
+        bucket_size = timedelta(hours=1)
+        label_format = "%m-%d %H:00"
+    else:
+        bucket_count = 7 if period == "week" else 30
+        bucket_start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=bucket_count - 1)
+        bucket_size = timedelta(days=1)
+        label_format = "%Y-%m-%d"
+
+    counts = [0] * bucket_count
+    for timestamp in journal.raised_events_since(
+        ip, bucket_start.astimezone(timezone.utc)
+    ):
+        event_time = datetime.fromisoformat(timestamp).astimezone()
+        bucket = int((event_time - bucket_start) // bucket_size)
+        if 0 <= bucket < bucket_count:
+            counts[bucket] += 1
+
+    print(f"\nНеисправности {ip} за период: {period}")
+    if not any(counts):
+        print("За выбранный период неисправностей не зарегистрировано.")
+        return
+
+    scale = max(1, (max(counts) + 39) // 40)
+    for index, count in enumerate(counts):
+        label = (bucket_start + index * bucket_size).strftime(label_format)
+        bar_length = (count + scale - 1) // scale
+        print(f"{label} | {'#' * bar_length} {count}")
+
+
 def main():
     configure_logging()
     parser = argparse.ArgumentParser(description="ASIC device monitoring")
     parser.add_argument("--scan", help="Network range to scan")
-    parser.add_argument("--firmware", default=DEFAULT_FIRMWARE, help="Path to firmware file")
     parser.add_argument("--telegram", action="store_true", help="Start Telegram bot instead of curses UI")
+    parser.add_argument("--fault-chart", action="store_true", help="Show recorded faults and exit")
+    parser.add_argument("--device", help="Device IP for --fault-chart (default: all devices)")
+    parser.add_argument("--period", choices=("day", "week", "month"), default="day")
     args = parser.parse_args()
 
     if not args.scan and not os.path.exists(CONFIG_FILE):
@@ -1702,8 +1517,15 @@ def main():
         return
 
     devices = asyncio.run(scan_network(args.scan)) if args.scan else load_devices()
+    if args.fault_chart:
+        if args.device and args.device not in devices:
+            parser.error(f"Unknown device IP: {args.device}")
+        journal = FaultJournal()
+        for ip in [args.device] if args.device else devices:
+            print_fault_chart(journal, ip, args.period)
+        return
+
     monitor = DeviceMonitor(devices)
-    monitor.firmware_path = args.firmware
 
     if args.telegram:
         from telegram_bot import run_telegram_bot

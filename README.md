@@ -105,6 +105,64 @@ ASIC Monitor is a command-line interface (CLI) tool for monitoring and managing 
     Commands without an IP list apply to all configured devices.
     Use `/help` in Telegram for syntax. If the bot does not respond, send `/whoami`, copy the numeric ID into `TELEGRAM_ALLOWED_USER_IDS`, and restart the bot.
 
+## Server and remote client
+
+The monitoring server discovers devices in an explicitly configured RFC1918
+IPv4 network, refreshes the device list every five minutes, and polls telemetry
+continuously. Server-side scans are limited to networks of 4096 addresses or
+fewer. The authenticated HTTP API listens on port `8080`; it exposes device
+telemetry and fault history, plus typed endpoints for the supported device
+operations. It does not expose arbitrary ASIC commands.
+
+Install `nmap` on the server and configure a unique token (at least 32
+characters) for each client in `ASIC_CLIENT_TOKENS`:
+
+```bash
+export ASIC_CLIENT_TOKENS='{"operator-1":"<64-hex-token>","operator-2":"<another-64-hex-token>"}'
+python3 server.py --network 192.168.1.0/24 --host 0.0.0.0 --port 8080
+```
+
+Generate each token with `openssl rand -hex 32`. Client IDs are recorded in the
+server log. For a single-client legacy setup, `ASIC_SERVER_TOKEN` is still
+accepted and is treated as client ID `admin`.
+
+For systemd, copy `systemd/asic-monitor.service` to
+`/etc/systemd/system/asic-monitor.service`, set its installation paths and
+service user, and create `/etc/asic-monitor.env` with `ASIC_NETWORK`,
+`ASIC_CLIENT_TOKENS`, and the ASIC account passwords. Then enable it with:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now asic-monitor
+```
+
+Configure the client with its own token from the server map. `status` prints
+the latest state once; `watch` streams updated state. The client also exposes
+the supported monitoring and management actions:
+
+```bash
+export ASIC_SERVER_TOKEN="<the-token-for-this-client>"
+python3 client.py --server http://miner-server:8080 status
+python3 client.py --server http://miner-server:8080 watch --interval 5
+python3 client.py --server http://miner-server:8080 faults --period week
+python3 client.py --server http://miner-server:8080 fault-report --period month --output faults.csv
+python3 client.py --server http://miner-server:8080 reboot 192.168.1.101
+python3 client.py --server http://miner-server:8080 power-mode --mode low 192.168.1.101
+python3 client.py --server http://miner-server:8080 power-limit --power 3000 192.168.1.101
+python3 client.py --server http://miner-server:8080 pools --file pools.json 192.168.1.101
+python3 client.py --server http://miner-server:8080 led 192.168.1.101
+python3 client.py --server http://miner-server:8080 factory-reset --confirm FACTORY_RESET 192.168.1.101
+```
+
+All management commands require explicit device IPs from the discovered list.
+Factory reset requires the explicit confirmation shown above. Fault history is
+collected by the monitor in `asic_faults.sqlite3`; chart periods are `day`,
+`week`, and `month`, and CSV export includes both raised and cleared events.
+The API uses bearer-token authentication and the client token identifies the
+operator in server logs. The service uses plain HTTP, so restrict port `8080`
+to a trusted management network and connect from outside it through a VPN or a
+TLS-terminating reverse proxy. Do not expose the port directly to the internet.
+
 ## Key Bindings
 
 | Key         | Action                           | Description                                     |

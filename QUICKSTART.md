@@ -47,6 +47,48 @@ python3 asic.py --fault-chart --period month
 
 Без `--device` график выводится отдельно для каждого настроенного устройства.
 
+## Сервер и удалённый клиент
+
+На сервере установите системный `nmap`, задайте отдельный токен для каждого
+клиента и запустите сервер. Указывайте только приватную сеть, которой вы
+управляете; сервер ограничивает её размер 4096 адресами.
+
+```bash
+export ASIC_CLIENT_TOKENS='{"laptop":"<64-hex-token>","ops":"<another-64-hex-token>"}'
+python3 server.py --network 192.168.1.0/24 --host 0.0.0.0 --port 8080
+```
+
+Для фонового запуска используйте `systemd/asic-monitor.service`: настройте
+пути и пользователя службы, укажите `ASIC_NETWORK`, `ASIC_CLIENT_TOKENS` и
+пароли ASIC в `/etc/asic-monitor.env`, затем выполните:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now asic-monitor
+```
+
+Клиенту передайте его персональный токен как `ASIC_SERVER_TOKEN`. Помимо
+просмотра телеметрии доступны история ошибок и операции управления:
+
+```bash
+export ASIC_SERVER_TOKEN="персональный_токен_клиента"
+python3 client.py --server http://miner-server:8080 status
+python3 client.py --server http://miner-server:8080 faults --period day
+python3 client.py --server http://miner-server:8080 fault-report --period week --output faults.csv
+python3 client.py --server http://miner-server:8080 reboot 192.168.1.100
+python3 client.py --server http://miner-server:8080 power-mode --mode low 192.168.1.100
+python3 client.py --server http://miner-server:8080 power-limit --power 3000 192.168.1.100
+python3 client.py --server http://miner-server:8080 pools --file pools.json 192.168.1.100
+python3 client.py --server http://miner-server:8080 led 192.168.1.100
+python3 client.py --server http://miner-server:8080 factory-reset --confirm FACTORY_RESET 192.168.1.100
+```
+
+Ошибки собираются монитором автоматически и хранятся в `asic_faults.sqlite3`.
+Команды управления требуют явных IP обнаруженных устройств; factory reset
+требует дополнительного подтверждения. Порт `8080` использует HTTP без TLS:
+ограничьте его межсетевым экраном и для доступа извне используйте VPN или
+HTTPS reverse proxy. Не публикуйте порт в интернет.
+
 ## Управление
 
 | Клавиша | Действие |

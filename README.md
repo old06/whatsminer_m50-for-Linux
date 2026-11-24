@@ -127,7 +127,9 @@ Firmware updates, frequency changes, and fan control are intentionally not
 available. Fan speed and target frequency remain visible as read-only telemetry.
 In the live monitor, use `1`, `2`, or `3` for day, week, or month. The up/down
 arrows change the selected device; left/right scroll through the chart's dated
-rows.
+rows. Press `a` to aggregate all devices and `s` to save the displayed scope
+and period as a CSV report under `reports/`. Reports include UTC and local
+timestamps, device IP, event state, error code, and description.
 
 ## Technologies Used
 

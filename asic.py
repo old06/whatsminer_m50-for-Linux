@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import curses
+import csv
 import nmap
 import json
 import hashlib
@@ -40,6 +41,7 @@ COMMAND_RETRIES = 3
 CONNECTION_TIMEOUT = 15
 READ_TIMEOUT = 50
 FAULT_DB_FILE = os.path.join(BASE_DIR, "asic_faults.sqlite3")
+REPORT_DIR = os.path.join(BASE_DIR, "reports")
 ENCRYPTED_COMMANDS = {'set.miner.pools', 'set.user.change_passwd', 'set.miner.power_percent'}
 OVERHEAT_TEMP = 80  # Температура перегрева
 ERROR_CODE_INFO = {
@@ -335,19 +337,43 @@ class FaultJournal:
                 )
             connection.commit()
 
-    def raised_events_since(self, ip: str, since: datetime) -> List[str]:
+    def raised_events_since(
+        self, ip: Optional[str], since: datetime
+    ) -> List[str]:
         with closing(sqlite3.connect(self.path)) as connection:
-            return [row[0] for row in connection.execute(
+            query = (
                 "SELECT occurred_at FROM fault_events "
-                "WHERE ip = ? AND state = 'raised' AND occurred_at >= ? "
-                "ORDER BY occurred_at",
-                (
-                    ip,
-                    since.astimezone(timezone.utc).isoformat(
-                        timespec="seconds"
-                    ),
-                ),
+                "WHERE state = 'raised' AND occurred_at >= ?"
+            )
+            parameters: List[Any] = [
+                since.astimezone(timezone.utc).isoformat(timespec="seconds")
+            ]
+            if ip is not None:
+                query += " AND ip = ?"
+                parameters.append(ip)
+            query += " ORDER BY occurred_at"
+            return [row[0] for row in connection.execute(
+                query,
+                parameters,
             )]
+
+    def events_between(
+        self, since: datetime, until: datetime, ip: Optional[str] = None
+    ) -> List[Tuple[str, str, str, str, str]]:
+        query = (
+            "SELECT ip, occurred_at, state, code, description "
+            "FROM fault_events WHERE occurred_at >= ? AND occurred_at <= ?"
+        )
+        parameters: List[Any] = [
+            since.astimezone(timezone.utc).isoformat(timespec="seconds"),
+            until.astimezone(timezone.utc).isoformat(timespec="seconds"),
+        ]
+        if ip is not None:
+            query += " AND ip = ?"
+            parameters.append(ip)
+        query += " ORDER BY occurred_at, ip, id"
+        with closing(sqlite3.connect(self.path)) as connection:
+            return list(connection.execute(query, parameters))
 
 
 class DeviceError(Exception):
@@ -390,6 +416,8 @@ class DeviceMonitor:
         self.chart_view = False
         self.chart_period = "day"
         self.chart_offset: Optional[int] = None
+        self.chart_all_devices = False
+        self.chart_notice = ""
         
     async def _init_async_resources(self):
         if self.operation_queue is None:
@@ -470,6 +498,31 @@ class DeviceMonitor:
                 elif key == ord('3'):
                     self.chart_period = "month"
                     self.chart_offset = None
+                elif key == ord('a'):
+                    self.chart_all_devices = not self.chart_all_devices
+                    self.chart_offset = None
+                    self.chart_notice = ""
+                elif key == ord('s'):
+                    devices = self._get_sorted_devices()
+                    if not self.chart_all_devices and not devices:
+                        self.chart_notice = "Нет устройств для экспорта"
+                    else:
+                        selected_ip = (
+                            None if self.chart_all_devices
+                            else devices[self.current_row]["ip"]
+                        )
+                        try:
+                            report_path = export_fault_report(
+                                self.fault_journal,
+                                self.chart_period,
+                                selected_ip,
+                            )
+                            self.chart_notice = (
+                                "CSV сохранён: "
+                                f"{os.path.basename(report_path)}"
+                            )
+                        except OSError as exc:
+                            self.chart_notice = f"Ошибка сохранения CSV: {exc}"
             elif key == ord('g'):
                 self.chart_view = True
                 self.detailed_view = False
@@ -724,14 +777,15 @@ class DeviceMonitor:
 
     async def _draw_fault_chart(self, stdscr, devices, height, width):
         stdscr.erase()
-        if not devices:
+        if not devices and not self.chart_all_devices:
             self._safe_addstr(stdscr, 1, 1, "Нет настроенных устройств")
             stdscr.refresh()
             return
 
-        device = devices[self.current_row]
+        device = devices[self.current_row] if devices else None
+        device_ip = None if self.chart_all_devices else device["ip"]
         points = fault_chart_data(
-            self.fault_journal, device["ip"], self.chart_period
+            self.fault_journal, device_ip, self.chart_period
         )
         page_size = max(1, height - 6)
         last_offset = max(0, len(points) - page_size)
@@ -741,8 +795,9 @@ class DeviceMonitor:
         visible_points = points[self.chart_offset:self.chart_offset + page_size]
         values = [value for _, value in visible_points]
         period_names = {"day": "сутки", "week": "неделя", "month": "месяц"}
+        device_label = "Все устройства" if self.chart_all_devices else device["ip"]
         title = (
-            f"Неисправности {device['ip']} за "
+            f"Неисправности: {device_label} за "
             f"{period_names[self.chart_period]} "
             f"| Всего: {sum(value for _, value in points)}"
         )
@@ -751,10 +806,13 @@ class DeviceMonitor:
             visible_start = self.chart_offset + 1
             visible_end = self.chart_offset + len(visible_points)
             interval = (
-                f"{visible_points[0][0]} - {visible_points[-1][0]} "
+                f"{device_label} | {visible_points[0][0]} - "
+                f"{visible_points[-1][0]} "
                 f"({visible_start}-{visible_end} из {len(points)})"
             )
             self._safe_addstr(stdscr, 1, 1, interval)
+        if self.chart_notice:
+            self._safe_addstr(stdscr, 2, 1, self.chart_notice)
 
         max_bar_width = max(1, width - 28)
         max_count = max(values, default=0)
@@ -767,11 +825,16 @@ class DeviceMonitor:
                 prefix + "#" * bar_length,
             )
 
-        help_text = (
-            "[Left/Right]Листать [Up/Down]Машина [1]Сутки [2]Неделя "
-            "[3]Месяц [g]Назад [q]Выход"
+        self._safe_addstr(
+            stdscr, height - 2, 0,
+            "[a]Все/одно [s]CSV [Left/Right]Страницы [Up/Down]Машина",
+            curses.A_REVERSE,
         )
-        self._safe_addstr(stdscr, height - 1, 0, help_text, curses.A_REVERSE)
+        self._safe_addstr(
+            stdscr, height - 1, 0,
+            "[1]Сутки [2]Неделя [3]Месяц [g]Назад [q]Выход",
+            curses.A_REVERSE,
+        )
         stdscr.refresh()
 
     async def _draw_device_details(self, stdscr, device: Dict, h: int, w: int):
@@ -1560,13 +1623,13 @@ def load_devices() -> List[str]:
         logging.error(f"Failed to load devices: {str(e)}")
         return []
 
-def fault_chart_data(
-    journal: FaultJournal, ip: str, period: str
-) -> List[Tuple[str, int]]:
+def fault_chart_window(
+    period: str, now: Optional[datetime] = None
+) -> Tuple[datetime, datetime, timedelta, int, str]:
     if period not in {"day", "week", "month"}:
         raise ValueError(f"Unsupported fault chart period: {period}")
 
-    now = datetime.now().astimezone()
+    now = now or datetime.now().astimezone()
     if period == "day":
         bucket_count = 24
         bucket_start = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=23)
@@ -1577,6 +1640,15 @@ def fault_chart_data(
         bucket_start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=bucket_count - 1)
         bucket_size = timedelta(days=1)
         label_format = "%d.%m.%Y"
+    return bucket_start, now, bucket_size, bucket_count, label_format
+
+
+def fault_chart_data(
+    journal: FaultJournal, ip: Optional[str], period: str
+) -> List[Tuple[str, int]]:
+    bucket_start, now, bucket_size, bucket_count, label_format = (
+        fault_chart_window(period)
+    )
 
     counts = [0] * bucket_count
     for timestamp in journal.raised_events_since(
@@ -1594,6 +1666,35 @@ def fault_chart_data(
         )
         for index, count in enumerate(counts)
     ]
+
+
+def export_fault_report(
+    journal: FaultJournal,
+    period: str,
+    ip: Optional[str] = None,
+    report_dir: str = REPORT_DIR,
+) -> str:
+    bucket_start, until, _, _, _ = fault_chart_window(period)
+    os.makedirs(report_dir, exist_ok=True)
+    scope = "all" if ip is None else ip.replace(".", "-")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    report_path = os.path.join(
+        report_dir, f"fault_report_{scope}_{period}_{timestamp}.csv"
+    )
+    events = journal.events_between(bucket_start, until, ip)
+    with open(report_path, "w", newline="", encoding="utf-8-sig") as report:
+        writer = csv.writer(report)
+        writer.writerow((
+            "datetime_utc", "datetime_local", "ip", "state", "code",
+            "description",
+        ))
+        for event_ip, occurred_at, state, code, description in events:
+            utc_time = datetime.fromisoformat(occurred_at)
+            local_time = utc_time.astimezone().strftime("%d.%m.%Y %H:%M:%S")
+            writer.writerow((
+                occurred_at, local_time, event_ip, state, code, description
+            ))
+    return report_path
 
 
 def print_fault_chart(journal: FaultJournal, ip: str, period: str) -> None:

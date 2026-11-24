@@ -387,6 +387,8 @@ class DeviceMonitor:
         self.api_semaphore = asyncio.Semaphore(MAX_CONCURRENT_OPS)
         self.restarting_devices: Set[str] = set()
         self.detailed_view = False  # Режим детального просмотра устройства
+        self.chart_view = False
+        self.chart_period = "day"
         
     async def _init_async_resources(self):
         if self.operation_queue is None:
@@ -449,6 +451,18 @@ class DeviceMonitor:
                 self._handle_key_up()
             elif key in [KEY_DOWN, 258, 66]:
                 self._handle_key_down(stdscr)
+            elif self.chart_view:
+                if key == ord('g'):
+                    self.chart_view = False
+                elif key == ord('1'):
+                    self.chart_period = "day"
+                elif key == ord('2'):
+                    self.chart_period = "week"
+                elif key == ord('3'):
+                    self.chart_period = "month"
+            elif key == ord('g'):
+                self.chart_view = True
+                self.detailed_view = False
             elif key == ord(' '):
                 self._toggle_device_selection()
             elif key == ord('r'):
@@ -648,6 +662,10 @@ class DeviceMonitor:
             self.current_row = 0
             self.scroll_offset = 0
         
+        if self.chart_view:
+            await self._draw_fault_chart(stdscr, valid_data, h, w)
+            return
+
         if self.detailed_view and valid_data and self.current_row < len(valid_data):
             await self._draw_device_details(stdscr, valid_data[self.current_row], h, w)
             return
@@ -677,9 +695,73 @@ class DeviceMonitor:
         
         help_text = (
             "[Space]Выбор [a]Все [r]Рестарт [l]LED [m]Режим "
-            "[L]Лимит [P]Пулы [d]Детали [F]Сброс [q]Выход"
+            "[L]Лимит [P]Пулы [d]Детали [g]График [F]Сброс [q]Выход"
         )
         self._safe_addstr(stdscr, h-1, 0, help_text.ljust(w-1), curses.A_REVERSE)
+        stdscr.refresh()
+
+    async def _draw_fault_chart(self, stdscr, devices, height, width):
+        stdscr.erase()
+        if not devices:
+            self._safe_addstr(stdscr, 1, 1, "Нет настроенных устройств")
+            stdscr.refresh()
+            return
+
+        device = devices[self.current_row]
+        points = fault_chart_data(
+            self.fault_journal, device["ip"], self.chart_period
+        )
+        labels = [label for label, _ in points]
+        values = [value for _, value in points]
+        period_names = {"day": "сутки", "week": "неделя", "month": "месяц"}
+        title = (
+            f"Неисправности {device['ip']} за "
+            f"{period_names[self.chart_period]} "
+            f"| Всего: {sum(values)}"
+        )
+        self._safe_addstr(stdscr, 0, 1, title, curses.A_BOLD)
+
+        plot_top = 3
+        plot_height = max(1, height - 7)
+        plot_x = 7
+        plot_width = max(1, width - plot_x - 2)
+        if max(values, default=0) == 0:
+            self._safe_addstr(
+                stdscr, plot_top, 1,
+                "За выбранный период неисправностей нет",
+            )
+        else:
+            bucket_count = min(len(values), plot_width)
+            grouped_values = []
+            for bucket in range(bucket_count):
+                start = bucket * len(values) // bucket_count
+                end = (bucket + 1) * len(values) // bucket_count
+                grouped_values.append(sum(values[start:end]))
+            maximum = max(grouped_values)
+            for row in range(plot_height):
+                y = plot_top + row
+                threshold = (
+                    maximum * (plot_height - row) + plot_height - 1
+                ) // plot_height
+                self._safe_addstr(stdscr, y, 0, f"{threshold:>5} |")
+                for bucket, value in enumerate(grouped_values):
+                    if value < threshold:
+                        continue
+                    start_x = plot_x + bucket * plot_width // bucket_count
+                    end_x = plot_x + (bucket + 1) * plot_width // bucket_count
+                    bar_width = max(1, end_x - start_x)
+                    self._safe_addstr(stdscr, y, start_x, "#" * bar_width)
+
+            self._safe_addstr(
+                stdscr, plot_top + plot_height, 1,
+                f"{labels[0]}  ->  {labels[-1]}",
+            )
+
+        help_text = (
+            "[1]Сутки [2]Неделя [3]Месяц [Up/Down]Устройство "
+            "[g]Назад [q]Выход"
+        )
+        self._safe_addstr(stdscr, height - 1, 0, help_text, curses.A_REVERSE)
         stdscr.refresh()
 
     async def _draw_device_details(self, stdscr, device: Dict, h: int, w: int):
@@ -1468,7 +1550,12 @@ def load_devices() -> List[str]:
         logging.error(f"Failed to load devices: {str(e)}")
         return []
 
-def print_fault_chart(journal: FaultJournal, ip: str, period: str) -> None:
+def fault_chart_data(
+    journal: FaultJournal, ip: str, period: str
+) -> List[Tuple[str, int]]:
+    if period not in {"day", "week", "month"}:
+        raise ValueError(f"Unsupported fault chart period: {period}")
+
     now = datetime.now().astimezone()
     if period == "day":
         bucket_count = 24
@@ -1490,14 +1577,25 @@ def print_fault_chart(journal: FaultJournal, ip: str, period: str) -> None:
         if 0 <= bucket < bucket_count:
             counts[bucket] += 1
 
+    return [
+        (
+            (bucket_start + index * bucket_size).strftime(label_format),
+            count,
+        )
+        for index, count in enumerate(counts)
+    ]
+
+
+def print_fault_chart(journal: FaultJournal, ip: str, period: str) -> None:
+    points = fault_chart_data(journal, ip, period)
+    counts = [count for _, count in points]
     print(f"\nНеисправности {ip} за период: {period}")
     if not any(counts):
         print("За выбранный период неисправностей не зарегистрировано.")
         return
 
     scale = max(1, (max(counts) + 39) // 40)
-    for index, count in enumerate(counts):
-        label = (bucket_start + index * bucket_size).strftime(label_format)
+    for label, count in points:
         bar_length = (count + scale - 1) // scale
         print(f"{label} | {'#' * bar_length} {count}")
 

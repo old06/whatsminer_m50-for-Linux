@@ -119,11 +119,14 @@ ASIC Monitor is a command-line interface (CLI) tool for monitoring and managing 
 | `L`         | Set Power Limit                  | Set a power consumption limit (0-99999 W)       |
 | `P`         | Set Pools                        | Configure mining pool settings                  |
 | `d`         | Toggle Detailed View             | Switch between list view and detailed view for selected device |
+| `g`         | Fault Chart                      | Open/close fault chart for the selected device |
 | `F`         | Factory Reset                    | Perform a factory reset on selected devices     |
 | `q` / `Esc` | Quit                             | Exit the application                            |
 
 Firmware updates, frequency changes, and fan control are intentionally not
 available. Fan speed and target frequency remain visible as read-only telemetry.
+In the live monitor, use `1`, `2`, or `3` for day, week, or month and the arrow
+keys to change the selected device while viewing its chart.
 
 ## Technologies Used
 

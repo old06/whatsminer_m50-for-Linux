@@ -389,6 +389,7 @@ class DeviceMonitor:
         self.detailed_view = False  # Режим детального просмотра устройства
         self.chart_view = False
         self.chart_period = "day"
+        self.chart_offset: Optional[int] = None
         
     async def _init_async_resources(self):
         if self.operation_queue is None:
@@ -442,6 +443,8 @@ class DeviceMonitor:
     async def _handle_input(self, stdscr):
         KEY_UP = curses.KEY_UP if hasattr(curses, 'KEY_UP') else 259
         KEY_DOWN = curses.KEY_DOWN if hasattr(curses, 'KEY_DOWN') else 258
+        KEY_LEFT = curses.KEY_LEFT if hasattr(curses, 'KEY_LEFT') else 260
+        KEY_RIGHT = curses.KEY_RIGHT if hasattr(curses, 'KEY_RIGHT') else 261
 
         key = stdscr.getch()
         while key != -1:
@@ -454,15 +457,23 @@ class DeviceMonitor:
             elif self.chart_view:
                 if key == ord('g'):
                     self.chart_view = False
+                elif key in [KEY_LEFT, 260]:
+                    self._scroll_fault_chart(stdscr, -1)
+                elif key in [KEY_RIGHT, 261]:
+                    self._scroll_fault_chart(stdscr, 1)
                 elif key == ord('1'):
                     self.chart_period = "day"
+                    self.chart_offset = None
                 elif key == ord('2'):
                     self.chart_period = "week"
+                    self.chart_offset = None
                 elif key == ord('3'):
                     self.chart_period = "month"
+                    self.chart_offset = None
             elif key == ord('g'):
                 self.chart_view = True
                 self.detailed_view = False
+                self.chart_offset = None
             elif key == ord(' '):
                 self._toggle_device_selection()
             elif key == ord('r'):
@@ -487,6 +498,17 @@ class DeviceMonitor:
                 ):
                     await self.factory_reset()
             key = stdscr.getch()
+
+    def _scroll_fault_chart(self, stdscr, direction: int) -> None:
+        total_points = {"day": 24, "week": 7, "month": 30}[self.chart_period]
+        page_size = max(1, stdscr.getmaxyx()[0] - 6)
+        last_page = max(0, total_points - page_size)
+        offset = (
+            last_page if self.chart_offset is None else self.chart_offset
+        )
+        self.chart_offset = max(
+            0, min(last_page, offset + direction * page_size)
+        )
 
     async def _confirm_action(self, stdscr, prompt: str) -> bool:
         h, _ = stdscr.getmaxyx()
@@ -711,55 +733,43 @@ class DeviceMonitor:
         points = fault_chart_data(
             self.fault_journal, device["ip"], self.chart_period
         )
-        labels = [label for label, _ in points]
-        values = [value for _, value in points]
+        page_size = max(1, height - 6)
+        last_offset = max(0, len(points) - page_size)
+        if self.chart_offset is None:
+            self.chart_offset = last_offset
+        self.chart_offset = max(0, min(self.chart_offset, last_offset))
+        visible_points = points[self.chart_offset:self.chart_offset + page_size]
+        values = [value for _, value in visible_points]
         period_names = {"day": "сутки", "week": "неделя", "month": "месяц"}
         title = (
             f"Неисправности {device['ip']} за "
             f"{period_names[self.chart_period]} "
-            f"| Всего: {sum(values)}"
+            f"| Всего: {sum(value for _, value in points)}"
         )
         self._safe_addstr(stdscr, 0, 1, title, curses.A_BOLD)
-
-        plot_top = 3
-        plot_height = max(1, height - 7)
-        plot_x = 7
-        plot_width = max(1, width - plot_x - 2)
-        if max(values, default=0) == 0:
-            self._safe_addstr(
-                stdscr, plot_top, 1,
-                "За выбранный период неисправностей нет",
+        if visible_points:
+            visible_start = self.chart_offset + 1
+            visible_end = self.chart_offset + len(visible_points)
+            interval = (
+                f"{visible_points[0][0]} - {visible_points[-1][0]} "
+                f"({visible_start}-{visible_end} из {len(points)})"
             )
-        else:
-            bucket_count = min(len(values), plot_width)
-            grouped_values = []
-            for bucket in range(bucket_count):
-                start = bucket * len(values) // bucket_count
-                end = (bucket + 1) * len(values) // bucket_count
-                grouped_values.append(sum(values[start:end]))
-            maximum = max(grouped_values)
-            for row in range(plot_height):
-                y = plot_top + row
-                threshold = (
-                    maximum * (plot_height - row) + plot_height - 1
-                ) // plot_height
-                self._safe_addstr(stdscr, y, 0, f"{threshold:>5} |")
-                for bucket, value in enumerate(grouped_values):
-                    if value < threshold:
-                        continue
-                    start_x = plot_x + bucket * plot_width // bucket_count
-                    end_x = plot_x + (bucket + 1) * plot_width // bucket_count
-                    bar_width = max(1, end_x - start_x)
-                    self._safe_addstr(stdscr, y, start_x, "#" * bar_width)
+            self._safe_addstr(stdscr, 1, 1, interval)
 
+        max_bar_width = max(1, width - 28)
+        max_count = max(values, default=0)
+        bar_scale = max(1, (max_count + max_bar_width - 1) // max_bar_width)
+        for row, (label, count) in enumerate(visible_points):
+            prefix = f"{label:16} | {count:5} | "
+            bar_length = (count + bar_scale - 1) // bar_scale
             self._safe_addstr(
-                stdscr, plot_top + plot_height, 1,
-                f"{labels[0]}  ->  {labels[-1]}",
+                stdscr, row + 3, 1,
+                prefix + "#" * bar_length,
             )
 
         help_text = (
-            "[1]Сутки [2]Неделя [3]Месяц [Up/Down]Устройство "
-            "[g]Назад [q]Выход"
+            "[Left/Right]Листать [Up/Down]Машина [1]Сутки [2]Неделя "
+            "[3]Месяц [g]Назад [q]Выход"
         )
         self._safe_addstr(stdscr, height - 1, 0, help_text, curses.A_REVERSE)
         stdscr.refresh()
@@ -1561,12 +1571,12 @@ def fault_chart_data(
         bucket_count = 24
         bucket_start = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=23)
         bucket_size = timedelta(hours=1)
-        label_format = "%m-%d %H:00"
+        label_format = "%d.%m.%Y %H:00"
     else:
         bucket_count = 7 if period == "week" else 30
         bucket_start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=bucket_count - 1)
         bucket_size = timedelta(days=1)
-        label_format = "%Y-%m-%d"
+        label_format = "%d.%m.%Y"
 
     counts = [0] * bucket_count
     for timestamp in journal.raised_events_since(

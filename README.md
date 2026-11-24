@@ -125,8 +125,9 @@ ASIC Monitor is a command-line interface (CLI) tool for monitoring and managing 
 
 Firmware updates, frequency changes, and fan control are intentionally not
 available. Fan speed and target frequency remain visible as read-only telemetry.
-In the live monitor, use `1`, `2`, or `3` for day, week, or month and the arrow
-keys to change the selected device while viewing its chart.
+In the live monitor, use `1`, `2`, or `3` for day, week, or month. The up/down
+arrows change the selected device; left/right scroll through the chart's dated
+rows.
 
 ## Technologies Used
 

@@ -68,10 +68,16 @@ sudo systemctl enable --now asic-monitor
 ```
 
 Клиенту передайте его персональный токен как `ASIC_SERVER_TOKEN`. Помимо
-просмотра телеметрии доступны история ошибок и операции управления:
+прежней curses-консоли доступны история ошибок и операции управления:
 
 ```bash
 export ASIC_SERVER_TOKEN="персональный_токен_клиента"
+python3 asic.py --server http://miner-server:8080
+```
+
+Клавиши и экраны такие же, как при локальной работе. Для скриптов есть CLI:
+
+```bash
 python3 client.py --server http://miner-server:8080 status
 python3 client.py --server http://miner-server:8080 faults --period day
 python3 client.py --server http://miner-server:8080 fault-report --period week --output faults.csv

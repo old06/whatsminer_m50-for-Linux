@@ -288,8 +288,15 @@ async def execute_command(
     async with operation_lock:
         monitor.selected_devices = devices
         if action == "reboot":
+            queued_devices = sorted(
+                devices - monitor.pending_operation_devices
+            )
             queued = await monitor.reboot_devices()
-            return {"success": queued == len(devices), "queued": queued}
+            return {
+                "success": queued == len(devices),
+                "queued": queued,
+                "queued_devices": queued_devices,
+            }
         if action == "power-mode":
             mode = payload.get("mode")
             if not isinstance(mode, str) or mode not in {

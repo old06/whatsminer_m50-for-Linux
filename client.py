@@ -2,10 +2,14 @@
 """Monitor and manage ASIC devices through a remote server."""
 
 import argparse
+import asyncio
+import curses
 import json
+import logging
 import os
 import sys
 import time
+from datetime import datetime
 from typing import Optional, Union
 from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
@@ -76,6 +80,165 @@ def add_devices_argument(command: argparse.ArgumentParser) -> None:
     command.add_argument("devices", nargs="+", help="IP-адреса ASIC")
 
 
+def create_remote_monitor(server_url: str, token: str):
+    from asic import DeviceMonitor, REBOOT_DURATION, REPORT_DIR
+
+    class RemoteDeviceMonitor(DeviceMonitor):
+        def __init__(self):
+            super().__init__([], collect_faults=False)
+            self.server_url = server_url
+            self.server_token = token
+
+        async def _init_async_resources(self):
+            if self.lock is None:
+                self.lock = asyncio.Lock()
+            if not self.active_tasks:
+                self.active_tasks.add(asyncio.create_task(
+                    self._update_stats(), name="remote-telemetry-poller"
+                ))
+
+        async def _update_stats(self):
+            while self.monitor_running:
+                if self.monitor_paused:
+                    await asyncio.sleep(1)
+                    continue
+                try:
+                    result = await asyncio.to_thread(
+                        get_telemetry, self.server_url, self.server_token
+                    )
+                    devices = [
+                        device for device in result["devices"]
+                        if isinstance(device, dict)
+                        and isinstance(device.get("ip"), str)
+                    ]
+                    self.devices = [device["ip"] for device in devices]
+                    async with self.lock:
+                        self.stats_cache["all_devices"] = devices
+                    for ip, (_, started_at, duration, _) in list(
+                        self.operation_progress.items()
+                    ):
+                        if time.time() - started_at >= duration:
+                            self.operation_progress.pop(ip, None)
+                            self.restarting_devices.discard(ip)
+                    updated_at = result.get("updated_at")
+                    if updated_at:
+                        self.last_stat_update = datetime.fromisoformat(
+                            updated_at
+                        ).timestamp()
+                except Exception as exc:
+                    logging.warning(
+                        "Ошибка получения данных с сервера: %s", exc
+                    )
+                await asyncio.sleep(1)
+
+        async def _send_action(self, action: str, **values):
+            devices = sorted(self.selected_devices)
+            if not devices:
+                return None
+            payload = {"devices": devices, **values}
+            try:
+                return await asyncio.to_thread(
+                    api_request,
+                    self.server_url,
+                    self.server_token,
+                    f"/api/commands/{action}",
+                    "POST",
+                    payload,
+                )
+            except Exception as exc:
+                logging.error(
+                    "Удалённая операция %s не выполнена: %s", action, exc
+                )
+                return None
+
+        async def reboot_devices(self) -> int:
+            result = await self._send_action("reboot")
+            if not isinstance(result, dict):
+                return 0
+            for ip in result.get("queued_devices", []):
+                self.restarting_devices.add(ip)
+                self.operation_progress[ip] = (
+                    "reboot", time.time(), REBOOT_DURATION, "final"
+                )
+            return result.get("queued", 0)
+
+        async def set_led_mode(self) -> bool:
+            result = await self._send_action("led")
+            return bool(isinstance(result, dict) and result.get("success"))
+
+        async def set_power_mode(self, mode: str) -> bool:
+            result = await self._send_action("power-mode", mode=mode)
+            return bool(isinstance(result, dict) and result.get("success"))
+
+        async def set_power_limit(self, power: int) -> bool:
+            result = await self._send_action("power-limit", power=power)
+            return bool(isinstance(result, dict) and result.get("success"))
+
+        async def set_pools(self, pools: list) -> bool:
+            result = await self._send_action("pools", pools=pools)
+            return bool(isinstance(result, dict) and result.get("success"))
+
+        async def factory_reset(self) -> bool:
+            result = await self._send_action(
+                "factory-reset", confirm="FACTORY_RESET"
+            )
+            return bool(isinstance(result, dict) and result.get("success"))
+
+        async def get_fault_chart_data(self, ip, period: str):
+            query = {"period": period}
+            if ip:
+                query["device"] = ip
+            result = await asyncio.to_thread(
+                api_request,
+                self.server_url,
+                self.server_token,
+                f"/api/faults?{urlencode(query)}",
+            )
+            if not isinstance(result, dict):
+                return []
+            return [
+                (point["time"], point["count"])
+                for point in result.get("points", [])
+            ]
+
+        async def export_fault_report(self, period: str, ip):
+            query = {"period": period}
+            if ip:
+                query["device"] = ip
+            report_data = await asyncio.to_thread(
+                api_request,
+                self.server_url,
+                self.server_token,
+                f"/api/faults/report?{urlencode(query)}",
+            )
+            if not isinstance(report_data, bytes):
+                raise OSError("Сервер не вернул CSV-файл")
+            os.makedirs(REPORT_DIR, exist_ok=True)
+            scope = "all" if ip is None else ip.replace(".", "-")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            report_path = os.path.join(
+                REPORT_DIR,
+                f"fault_report_remote_{scope}_{period}_{timestamp}.csv",
+            )
+            with open(report_path, "wb") as report_file:
+                report_file.write(report_data)
+            return report_path
+
+    return RemoteDeviceMonitor()
+
+
+def run_console(server_url: str, token: str) -> None:
+    monitor = create_remote_monitor(server_url, token)
+
+    def curses_main(stdscr):
+        try:
+            asyncio.run(monitor.monitor(stdscr))
+        except KeyboardInterrupt:
+            logging.info("Удалённая консоль остановлена")
+
+    curses.wrapper(curses_main)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="ASIC telemetry client")
     parser.add_argument(
@@ -85,6 +248,7 @@ def main() -> None:
     )
     parser.add_argument("--interval", type=int, default=5)
     commands = parser.add_subparsers(dest="command")
+    commands.add_parser("console", help="полная curses-консоль ASIC")
     watch = commands.add_parser(
         "watch", help="непрерывно показывать телеметрию"
     )
@@ -145,7 +309,11 @@ def main() -> None:
     if not token:
         parser.error("Задайте ASIC_SERVER_TOKEN в окружении или .env")
 
-    if args.command in {None, "watch"}:
+    if args.command in {None, "console"}:
+        run_console(args.server, token)
+        return
+
+    if args.command == "watch":
         while True:
             try:
                 data = get_telemetry(args.server, token)

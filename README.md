@@ -142,6 +142,7 @@ the supported monitoring and management actions:
 
 ```bash
 export ASIC_SERVER_TOKEN="<the-token-for-this-client>"
+python3 asic.py --server http://miner-server:8080
 python3 client.py --server http://miner-server:8080 status
 python3 client.py --server http://miner-server:8080 watch --interval 5
 python3 client.py --server http://miner-server:8080 faults --period week
@@ -158,6 +159,9 @@ All management commands require explicit device IPs from the discovered list.
 Factory reset requires the explicit confirmation shown above. Fault history is
 collected by the monitor in `asic_faults.sqlite3`; chart periods are `day`,
 `week`, and `month`, and CSV export includes both raised and cleared events.
+The `asic.py --server` command opens the original curses console; its navigation,
+device selection, detail screen, fault chart, keyboard shortcuts, and management
+dialogs work through the remote server.
 The API uses bearer-token authentication and the client token identifies the
 operator in server logs. The service uses plain HTTP, so restrict port `8080`
 to a trusted management network and connect from outside it through a VPN or a

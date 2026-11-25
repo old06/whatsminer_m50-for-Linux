@@ -393,7 +393,7 @@ class ValidationError(DeviceError):
     pass
 
 class DeviceMonitor:
-    def __init__(self, devices: List[str]):
+    def __init__(self, devices: List[str], collect_faults: bool = True):
         self.devices = devices
         self.monitor_running = True
         self.current_account = "super"
@@ -408,7 +408,7 @@ class DeviceMonitor:
         self.operation_queue = None
         self.pending_operation_devices: Set[str] = set()
         self.operation_progress: Dict[str, Tuple] = {}
-        self.fault_journal = FaultJournal()
+        self.fault_journal = FaultJournal() if collect_faults else None
         self.lock = None
         self.api_semaphore = asyncio.Semaphore(MAX_CONCURRENT_OPS)
         self.restarting_devices: Set[str] = set()
@@ -512,10 +512,8 @@ class DeviceMonitor:
                             else devices[self.current_row]["ip"]
                         )
                         try:
-                            report_path = export_fault_report(
-                                self.fault_journal,
-                                self.chart_period,
-                                selected_ip,
+                            report_path = await self.export_fault_report(
+                                self.chart_period, selected_ip
                             )
                             self.chart_notice = (
                                 "CSV сохранён: "
@@ -775,6 +773,16 @@ class DeviceMonitor:
         self._safe_addstr(stdscr, h-1, 0, help_text.ljust(w-1), curses.A_REVERSE)
         stdscr.refresh()
 
+    async def get_fault_chart_data(
+        self, ip: Optional[str], period: str
+    ) -> List[Tuple[str, int]]:
+        return fault_chart_data(self.fault_journal, ip, period)
+
+    async def export_fault_report(
+        self, period: str, ip: Optional[str]
+    ) -> str:
+        return export_fault_report(self.fault_journal, period, ip)
+
     async def _draw_fault_chart(self, stdscr, devices, height, width):
         stdscr.erase()
         if not devices and not self.chart_all_devices:
@@ -784,9 +792,7 @@ class DeviceMonitor:
 
         device = devices[self.current_row] if devices else None
         device_ip = None if self.chart_all_devices else device["ip"]
-        points = fault_chart_data(
-            self.fault_journal, device_ip, self.chart_period
-        )
+        points = await self.get_fault_chart_data(device_ip, self.chart_period)
         page_size = max(1, height - 6)
         last_offset = max(0, len(points) - page_size)
         if self.chart_offset is None:
@@ -1715,11 +1721,24 @@ def main():
     configure_logging()
     parser = argparse.ArgumentParser(description="ASIC device monitoring")
     parser.add_argument("--scan", help="Network range to scan")
+    parser.add_argument(
+        "--server", help="Remote ASIC Monitor URL (client console mode)"
+    )
     parser.add_argument("--telegram", action="store_true", help="Start Telegram bot instead of curses UI")
     parser.add_argument("--fault-chart", action="store_true", help="Show recorded faults and exit")
     parser.add_argument("--device", help="Device IP for --fault-chart (default: all devices)")
     parser.add_argument("--period", choices=("day", "week", "month"), default="day")
     args = parser.parse_args()
+
+    if args.server:
+        if args.scan or args.telegram or args.fault_chart:
+            parser.error("--server cannot be combined with local mode options")
+        token = os.getenv("ASIC_SERVER_TOKEN", "")
+        if not token:
+            parser.error("Set ASIC_SERVER_TOKEN for the remote server")
+        from client import run_console
+        run_console(args.server, token)
+        return
 
     if not args.scan and not os.path.exists(CONFIG_FILE):
         print("Необходимо указать --scan для первого запуска")
